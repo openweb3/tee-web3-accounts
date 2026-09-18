@@ -1,12 +1,14 @@
 package api
 
 import (
+	"crypto/subtle"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/openweb3/tee-web3-accounts/internal/store"
@@ -27,6 +29,13 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 // handleCreateAccount 创建账户：分配索引、实时派生地址、存下密码验证子。
 // 私钥既不落盘也不返回，服务端自己也不留。
 func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
+	// 创建会消耗 Argon2 时间并写盘，配置了 admin token 时必须有准入凭据，
+	// 否则任何人都能用创建请求把服务拖住。
+	if s.adminToken != "" && !tokenMatches(s.adminToken, r.Header.Get("Authorization")) {
+		writeError(w, http.StatusUnauthorized, "未授权")
+		return
+	}
+
 	var request createAccountRequest
 	if err := decodeJSON(w, r, &request); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -37,7 +46,7 @@ func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	release, ok := s.tryAcquireUnlock()
+	release, ok := tryAcquire(s.creates)
 	if !ok {
 		writeUnavailable(w)
 		return
@@ -46,6 +55,10 @@ func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 
 	account, err := s.store.Create(request.Password, s.wallet.Address)
 	if err != nil {
+		if errors.Is(err, store.ErrCapacity) {
+			writeError(w, http.StatusServiceUnavailable, "账户数量已达上限")
+			return
+		}
 		slog.Error("创建账户失败", "error", err)
 		writeError(w, http.StatusInternalServerError, "创建账户失败")
 		return
@@ -56,6 +69,15 @@ func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 		Path:    s.wallet.AccountPath(account.Index),
 		Address: account.Address,
 	})
+}
+
+// tokenMatches 常数时间比较 Authorization 头里的 Bearer token。
+func tokenMatches(want, header string) bool {
+	token, ok := strings.CutPrefix(header, "Bearer ")
+	if !ok || len(token) != len(want) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(token), []byte(want)) == 1
 }
 
 // handleGetAccount 按索引查询地址。地址是公开信息，不需要密码。
@@ -108,7 +130,7 @@ func (s *Server) handleSign(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	release, ok := s.tryAcquireUnlock()
+	release, ok := tryAcquire(s.unlocks)
 	if !ok {
 		writeUnavailable(w)
 		return
@@ -116,13 +138,19 @@ func (s *Server) handleSign(w http.ResponseWriter, r *http.Request) {
 	defer release()
 
 	if err := s.store.VerifyPassword(request.Index, request.Password); err != nil {
-		// ErrUnauthorized 之外的错误说明账户库本身有问题，要区分开。
-		if !errors.Is(err, store.ErrUnauthorized) {
+		var lockErr *store.LockoutError
+		switch {
+		case errors.As(err, &lockErr):
+			// 响应体与普通失败完全一致，只加 Retry-After 提示重试时机。
+			seconds := int((lockErr.RetryAfter + time.Second - 1) / time.Second)
+			w.Header().Set("Retry-After", fmt.Sprintf("%d", seconds))
+			writeError(w, http.StatusUnauthorized, "索引或密码不正确")
+		case errors.Is(err, store.ErrUnauthorized):
+			writeError(w, http.StatusUnauthorized, "索引或密码不正确")
+		default:
 			slog.Error("校验密码失败", "index", request.Index, "error", err)
 			writeError(w, http.StatusInternalServerError, "校验密码失败")
-			return
 		}
-		writeError(w, http.StatusUnauthorized, "索引或密码不正确")
 		return
 	}
 

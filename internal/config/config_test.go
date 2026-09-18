@@ -17,6 +17,7 @@ func clearEnv(t *testing.T) {
 	for _, name := range []string{
 		EnvMnemonic, EnvMnemonicFile, EnvPassphrase,
 		EnvAccountRootPath, EnvListenAddr, EnvDataFile, EnvMaxUnlocks,
+		EnvAdminToken, EnvMaxAccounts, EnvAllowPublicListen,
 	} {
 		t.Setenv(name, "")
 	}
@@ -109,6 +110,9 @@ func TestFromEnvOverrides(t *testing.T) {
 	t.Setenv(EnvListenAddr, "0.0.0.0:9999")
 	t.Setenv(EnvDataFile, "/tmp/accounts.json")
 	t.Setenv(EnvMaxUnlocks, "8")
+	t.Setenv(EnvAdminToken, "secret")
+	t.Setenv(EnvMaxAccounts, "100")
+	t.Setenv(EnvAllowPublicListen, "1")
 
 	cfg, err := FromEnv()
 	if err != nil {
@@ -122,6 +126,15 @@ func TestFromEnvOverrides(t *testing.T) {
 	}
 	if cfg.MaxConcurrentUnlocks != 8 {
 		t.Errorf("MaxConcurrentUnlocks = %d", cfg.MaxConcurrentUnlocks)
+	}
+	if cfg.AdminToken != "secret" {
+		t.Errorf("AdminToken = %q", cfg.AdminToken)
+	}
+	if cfg.MaxAccounts != 100 {
+		t.Errorf("MaxAccounts = %d", cfg.MaxAccounts)
+	}
+	if !cfg.AllowPublicListen {
+		t.Error("AllowPublicListen 应为 true")
 	}
 
 	// 带额外口令的钱包应当派生出与不带口令时不同的地址。
@@ -152,6 +165,47 @@ func TestFromEnvRejectsBadMaxUnlocks(t *testing.T) {
 
 	for _, value := range []string{"0", "-1", "abc", "1.5"} {
 		t.Setenv(EnvMaxUnlocks, value)
+		if _, err := FromEnv(); err == nil {
+			t.Errorf("%q 应当被拒绝", value)
+		}
+	}
+}
+
+// TestFromEnvRejectsPublicListenWithoutFlag 覆盖 M2：没有显式放行时，
+// 绑非回环地址必须拒绝启动。
+func TestFromEnvRejectsPublicListenWithoutFlag(t *testing.T) {
+	clearEnv(t)
+	t.Setenv(EnvMnemonic, testMnemonic)
+	t.Setenv(EnvListenAddr, "0.0.0.0:8080")
+
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("非回环监听地址应当被拒绝")
+	} else if !strings.Contains(err.Error(), EnvAllowPublicListen) {
+		t.Errorf("错误信息没有指明放行开关: %v", err)
+	}
+}
+
+func TestFromEnvAcceptsPublicListenWithFlag(t *testing.T) {
+	clearEnv(t)
+	t.Setenv(EnvMnemonic, testMnemonic)
+	t.Setenv(EnvListenAddr, "0.0.0.0:8080")
+	t.Setenv(EnvAllowPublicListen, "1")
+
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatalf("FromEnv: %v", err)
+	}
+	if cfg.ListenAddr != "0.0.0.0:8080" {
+		t.Errorf("ListenAddr = %q", cfg.ListenAddr)
+	}
+}
+
+func TestFromEnvRejectsBadMaxAccounts(t *testing.T) {
+	clearEnv(t)
+	t.Setenv(EnvMnemonic, testMnemonic)
+
+	for _, value := range []string{"0", "-1", "abc", "4294967296"} {
+		t.Setenv(EnvMaxAccounts, value)
 		if _, err := FromEnv(); err == nil {
 			t.Errorf("%q 应当被拒绝", value)
 		}

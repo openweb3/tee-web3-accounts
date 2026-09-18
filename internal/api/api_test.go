@@ -323,7 +323,7 @@ func TestSignWrongPasswordDoesNotRevealIndexExistence(t *testing.T) {
 	}
 }
 
-// TestPasswordCanBeReusedAcrossAccounts 记录当前语义：密码策略是「每个账户一份」，
+// TestPasswordKeyedByIndex 记录当前语义：密码策略是「每个账户一份」，
 // 不同账户可以使用同一个密码，各自独立校验。
 func TestPasswordKeyedByIndex(t *testing.T) {
 	t.Parallel()
@@ -366,21 +366,87 @@ func TestUnlockBackpressure(t *testing.T) {
 		t.Fatalf("api.New: %v", err)
 	}
 
-	// 手动占满唯一的名额，模拟并发压力下的背压。
-	server.unlocks <- struct{}{}
+	// 签名与创建分池：签名通道打满只影响签名，创建通道打满只影响创建。
+	validHash := strings.Repeat("ab", 32)
 
-	status, body, header := request(t, server.Handler(), http.MethodPost, "/v1/accounts",
-		fmt.Sprintf(`{"password":%q}`, testPassword))
+	server.unlocks <- struct{}{}
+	status, body, header := request(t, server.Handler(), http.MethodPost, "/v1/sign",
+		fmt.Sprintf(`{"index":0,"password":%q,"hash":%q}`, testPassword, validHash))
 	if status != http.StatusServiceUnavailable {
-		t.Fatalf("状态码 = %d, want 503 (body %s)", status, body)
+		t.Fatalf("签名通道打满时状态码 = %d, want 503 (body %s)", status, body)
 	}
 	if header.Get("Retry-After") == "" {
 		t.Error("503 响应缺少 Retry-After")
 	}
-
-	// 释放名额后必须恢复正常。
-	<-server.unlocks
+	// 签名通道打满不影响创建（创建走自己的池）。
 	createAccount(t, server.Handler())
+	<-server.unlocks
+
+	for range cap(server.creates) {
+		server.creates <- struct{}{}
+	}
+	status, body, header = request(t, server.Handler(), http.MethodPost, "/v1/accounts",
+		fmt.Sprintf(`{"password":%q}`, testPassword))
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("创建通道打满时状态码 = %d, want 503 (body %s)", status, body)
+	}
+	if header.Get("Retry-After") == "" {
+		t.Error("503 响应缺少 Retry-After")
+	}
+	for range cap(server.creates) {
+		<-server.creates
+	}
+	createAccount(t, server.Handler())
+}
+
+func TestCreateRequiresAdminToken(t *testing.T) {
+	t.Parallel()
+
+	accountWallet, err := wallet.Open(wallet.Config{Mnemonic: testMnemonic})
+	if err != nil {
+		t.Fatalf("wallet.Open: %v", err)
+	}
+	accountStore, err := store.Open(filepath.Join(t.TempDir(), "accounts.json"), fastParams)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	server, err := New(Config{Wallet: accountWallet, Store: accountStore, AdminToken: "secret"})
+	if err != nil {
+		t.Fatalf("api.New: %v", err)
+	}
+	handler := server.Handler()
+
+	create := func(auth string) (int, string) {
+		req := httptest.NewRequest(http.MethodPost, "/v1/accounts",
+			bytes.NewReader([]byte(fmt.Sprintf(`{"password":%q}`, testPassword))))
+		req.Header.Set("Content-Type", "application/json")
+		if auth != "" {
+			req.Header.Set("Authorization", auth)
+		}
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, req)
+		return recorder.Code, recorder.Body.String()
+	}
+
+	// 无凭据、错误 token 都被拒。
+	if status, body := create(""); status != http.StatusUnauthorized {
+		t.Errorf("无凭据状态码 = %d, want 401 (body %s)", status, body)
+	}
+	if status, body := create("Bearer wrong"); status != http.StatusUnauthorized {
+		t.Errorf("错误 token 状态码 = %d, want 401 (body %s)", status, body)
+	}
+	// 正确 token 放行。
+	if status, body := create("Bearer secret"); status != http.StatusCreated {
+		t.Errorf("正确 token 状态码 = %d, want 201 (body %s)", status, body)
+	}
+
+	// 签名接口不受 admin token 约束，只认账户密码。
+	hash := strings.Repeat("ab", 32)
+	status, body, _ := request(t, handler, http.MethodPost, "/v1/sign",
+		fmt.Sprintf(`{"index":0,"password":%q,"hash":%q}`, testPassword, hash))
+	if status != http.StatusOK {
+		t.Errorf("不带 token 签名状态码 = %d, want 200 (body %s)", status, body)
+	}
 }
 
 func TestRoutingRejectsUnsupportedMethods(t *testing.T) {

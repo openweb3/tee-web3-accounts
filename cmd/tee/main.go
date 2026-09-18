@@ -46,6 +46,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	warnIfTestMnemonic(cfg.Mnemonic)
 
 	if dir := filepath.Dir(cfg.DataFile); dir != "" && dir != "." {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -57,6 +58,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	accountStore.SetMaxAccounts(cfg.MaxAccounts)
 
 	// 启动时确认账户库里的地址都能由当前助记词重新派生出来。换错助记词是这套
 	// 系统最危险的静默故障，必须在这里拦住。
@@ -67,6 +69,7 @@ func run() error {
 	server, err := api.New(api.Config{
 		Wallet:               accountWallet,
 		Store:                accountStore,
+		AdminToken:           cfg.AdminToken,
 		MaxConcurrentUnlocks: cfg.MaxConcurrentUnlocks,
 	})
 	if err != nil {
@@ -112,4 +115,21 @@ func run() error {
 		return fmt.Errorf("优雅关闭失败: %w", err)
 	}
 	return nil
+}
+
+// knownTestMnemonics 是各工具链默认的公开测试助记词。生产 TEE 用了它们等于把
+// 私钥公开；这里只告警不拒绝，因为本仓库自己的 e2e 与 cloudtest 就在用它们。
+var knownTestMnemonics = []string{
+	"test test test test test test test test test test test junk",
+	"abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+}
+
+func warnIfTestMnemonic(mnemonic string) {
+	for _, known := range knownTestMnemonics {
+		if mnemonic == known {
+			slog.Warn("检测到公开的测试助记词，不要用它托管真实资产",
+				"hint", "生产环境请通过 TEE_MNEMONIC_FILE 配置一个全新生成的助记词")
+			return
+		}
+	}
 }

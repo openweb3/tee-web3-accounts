@@ -43,6 +43,9 @@ func Open(cfg Config) (*Wallet, error) {
 	if err := ValidateMnemonic(cfg.Mnemonic); err != nil {
 		return nil, err
 	}
+	if !isASCII(cfg.Passphrase) {
+		return nil, errors.New("wallet: BIP-39 额外口令只支持 ASCII 字符（非 ASCII 需要 NFKD 归一化，当前不支持）")
+	}
 
 	rootPath := cfg.AccountRootPath
 	if rootPath == "" {
@@ -64,9 +67,10 @@ func Open(cfg Config) (*Wallet, error) {
 		master.key.Zero()
 		return nil, err
 	}
-	// 账户根节点是独立派生出来的，主私钥用完立刻抹掉。
+	// 账户根节点是独立派生出来的，主私钥与主链码用完立刻抹掉。
 	if root != master {
 		master.key.Zero()
+		zero(master.code[:])
 	}
 
 	return &Wallet{root: root, rootPath: rootPath}, nil
@@ -167,4 +171,15 @@ func zero(b []byte) {
 	for i := range b {
 		b[i] = 0
 	}
+}
+
+// isASCII 检查字符串是否全部是 ASCII 字符。BIP-39 额外口令若含非 ASCII 字符，
+// 需要先做 NFKD 归一化才能被任意钱包复现；这里不支持归一化，直接拒绝。
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] > 0x7F {
+			return false
+		}
+	}
+	return true
 }

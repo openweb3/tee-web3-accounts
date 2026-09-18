@@ -38,9 +38,13 @@ func newMasterNode(seed []byte) (*bip32Node, error) {
 
 	var scalar secp256k1.ModNScalar
 	if overflow := scalar.SetBytes(&left); overflow != 0 || scalar.IsZero() {
+		zero(left[:])
 		return nil, fmt.Errorf("%w: 种子不产生合法的主私钥", ErrDerive)
 	}
-	return &bip32Node{key: scalarToKey(&scalar), code: code}, nil
+	zero(left[:])
+	key := scalarToKey(&scalar)
+	scalar.Zero()
+	return &bip32Node{key: key, code: code}, nil
 }
 
 // child 执行 BIP-32 的 CKDpriv：父扩展私钥 -> 子扩展私钥。
@@ -67,6 +71,7 @@ func (n *bip32Node) child(index uint32) (*bip32Node, error) {
 
 	var left [32]byte
 	copy(left[:], sum[:32])
+	defer zero(left[:])
 	var code [32]byte
 	copy(code[:], sum[32:])
 
@@ -79,14 +84,18 @@ func (n *bip32Node) child(index uint32) (*bip32Node, error) {
 	var child secp256k1.ModNScalar
 	child.Set(&n.key.Key)
 	child.Add(&tweak)
+	tweak.Zero()
 	if child.IsZero() {
 		return nil, fmt.Errorf("%w: 索引 %d 派生出零私钥", ErrDerive, index)
 	}
-	return &bip32Node{key: scalarToKey(&child), code: code}, nil
+	key := scalarToKey(&child)
+	child.Zero()
+	return &bip32Node{key: key, code: code}, nil
 }
 
 // derivePath 从当前节点出发，按 BIP-32 路径逐级派生出子节点。
-// 路径为 "m" 时返回节点自身。
+// 路径为 "m" 时返回节点自身。中间节点用完即抹掉：Go 的 GC 不会清零释放的内存，
+// 不主动归零的话，硬化派生出的各级父私钥会一直留在堆里。
 func (n *bip32Node) derivePath(path string) (*bip32Node, error) {
 	indices, err := parsePath(path)
 	if err != nil {
@@ -94,10 +103,15 @@ func (n *bip32Node) derivePath(path string) (*bip32Node, error) {
 	}
 	node := n
 	for _, index := range indices {
-		node, err = node.child(index)
+		next, err := node.child(index)
 		if err != nil {
 			return nil, err
 		}
+		if node != n { // 入口节点归调用方所有，不在这里清理
+			node.key.Zero()
+			zero(node.code[:])
+		}
+		node = next
 	}
 	return node, nil
 }

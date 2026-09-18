@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // fastParams 把 Argon2id 的代价压到最低，让测试跑得快；代价参数的正确性由
@@ -99,8 +100,12 @@ func TestVerifyPassword(t *testing.T) {
 	t.Parallel()
 
 	s, _ := openTemp(t)
-	if _, err := s.Create("correct horse battery", fakeAddress); err != nil {
-		t.Fatalf("Create: %v", err)
+	// 建 3 个账户：每个失败用例各用一个账户、各失败一次，避开指数退避锁定的干扰
+	// （锁定行为由 TestLockoutEscalates 单独覆盖）。
+	for range 3 {
+		if _, err := s.Create("correct horse battery", fakeAddress); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
 	}
 
 	if err := s.VerifyPassword(0, "correct horse battery"); err != nil {
@@ -112,7 +117,7 @@ func TestVerifyPassword(t *testing.T) {
 		password string
 	}{
 		{"密码错误", 0, "correct horse batter"},
-		{"密码为空", 0, ""},
+		{"密码为空", 1, ""},
 		{"索引不存在", 7, "correct horse battery"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -136,6 +141,10 @@ func TestPersistAndReload(t *testing.T) {
 		if _, err := s.Create("correct horse battery", fakeAddress); err != nil {
 			t.Fatalf("Create: %v", err)
 		}
+	}
+	// 先释放文件锁再重开，模拟真实的重启路径。
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
 	}
 
 	reloaded, err := Open(path, fastParams)
@@ -281,6 +290,9 @@ func TestConcurrentCreateKeepsIndicesUnique(t *testing.T) {
 		}
 		seen[index] = true
 	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
 
 	reloaded, err := Open(path, fastParams)
 	if err != nil {
@@ -335,5 +347,137 @@ func TestDefaultParamsAreUsable(t *testing.T) {
 	}
 	if err := s.VerifyPassword(0, "wrong password"); !errors.Is(err, ErrUnauthorized) {
 		t.Errorf("错误密码: %v", err)
+	}
+}
+
+func TestMaxAccounts(t *testing.T) {
+	t.Parallel()
+
+	s, _ := openTemp(t)
+	defer s.Close()
+	s.SetMaxAccounts(2)
+	for range 2 {
+		if _, err := s.Create("correct horse battery", fakeAddress); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+	}
+	if _, err := s.Create("correct horse battery", fakeAddress); !errors.Is(err, ErrCapacity) {
+		t.Errorf("超过上限的创建 = %v, want ErrCapacity", err)
+	}
+	if s.Len() != 2 {
+		t.Errorf("Len() = %d, want 2", s.Len())
+	}
+}
+
+func TestLockoutEscalates(t *testing.T) {
+	t.Parallel()
+
+	s, _ := openTemp(t)
+	defer s.Close()
+	if _, err := s.Create("correct horse battery", fakeAddress); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	var lockErr *LockoutError
+	// 第一次失败不锁，只回 ErrUnauthorized。
+	if err := s.VerifyPassword(0, "wrong password"); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("第一次失败 err = %v", err)
+	}
+	// 从第二次失败起进入指数退避锁定。
+	if err := s.VerifyPassword(0, "wrong password"); !errors.As(err, &lockErr) {
+		t.Fatalf("第二次失败 err = %v, want LockoutError", err)
+	}
+	if lockErr.RetryAfter < lockoutBase || lockErr.RetryAfter > lockoutMax {
+		t.Errorf("RetryAfter = %v, want 在 [%v, %v] 内", lockErr.RetryAfter, lockoutBase, lockoutMax)
+	}
+	// 锁定期内正确密码也拿不到，避免在线爆破绕过。
+	if err := s.VerifyPassword(0, "correct horse battery"); !errors.As(err, &lockErr) {
+		t.Fatalf("锁定期内 err = %v, want LockoutError", err)
+	}
+	// 期满后正确密码恢复。
+	time.Sleep(lockErr.RetryAfter + 20*time.Millisecond)
+	if err := s.VerifyPassword(0, "correct horse battery"); err != nil {
+		t.Errorf("期满后 err = %v, want nil", err)
+	}
+	// 成功后失败计数清零：下次再错从头算。
+	if err := s.VerifyPassword(0, "wrong password"); !errors.Is(err, ErrUnauthorized) {
+		t.Errorf("清零后的第一次失败 err = %v, want ErrUnauthorized", err)
+	}
+}
+
+func TestOpenRejectsEmptyFile(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "accounts.json")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	s, err := Open(path, fastParams)
+	if s != nil {
+		s.Close()
+	}
+	if err == nil {
+		t.Fatal("空文件被接受")
+	}
+}
+
+func TestSecondOpenFailsWhileLocked(t *testing.T) {
+	t.Parallel()
+
+	s, path := openTemp(t)
+	defer s.Close()
+	if _, err := Open(path, fastParams); err == nil {
+		t.Fatal("锁被占住时竟然能重开同一个账户库")
+	}
+}
+
+func TestOpenCleansStaleTempFiles(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "accounts.json")
+	stale := filepath.Join(dir, "accounts.json.tmp-123")
+	if err := os.WriteFile(stale, []byte("junk"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	s, err := Open(path, fastParams)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	if _, err := os.Stat(stale); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("崩溃遗留的临时文件没有被清理: %v", err)
+	}
+}
+
+// TestHashMatchesCapsRecordedParams 覆盖 M5：记录里的代价参数不可信，
+// 超过当前配置一律视为不匹配，防止篡改文件把单次校验内存顶到上限。
+func TestHashMatchesCapsRecordedParams(t *testing.T) {
+	t.Parallel()
+
+	s, _ := openTemp(t)
+	defer s.Close()
+	account, err := s.Create("correct horse battery", fakeAddress)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	if !s.hashMatches(account.PasswordHash, "correct horse battery") {
+		t.Error("正常记录应当匹配")
+	}
+	for name, mutate := range map[string]func(*PasswordHash){
+		"算法":     func(h *PasswordHash) { h.Algorithm = "sha256" },
+		"迭代轮数":   func(h *PasswordHash) { h.Time = 32 },
+		"内存顶到上限": func(h *PasswordHash) { h.MemoryKiB = 1 << 20 },
+		"并行度":    func(h *PasswordHash) { h.Threads = 64 },
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := account.PasswordHash
+			mutate(&h)
+			if s.hashMatches(h, "correct horse battery") {
+				t.Error("被篡改的记录仍然匹配")
+			}
+		})
 	}
 }

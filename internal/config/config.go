@@ -4,6 +4,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -14,13 +15,16 @@ import (
 // 配置项名。用环境变量而不是配置文件，是为了让部署脚本（含 cloudtest）能直接注入，
 // 且助记词可以只经过一次内存传递。
 const (
-	EnvMnemonic        = "TEE_MNEMONIC"
-	EnvMnemonicFile    = "TEE_MNEMONIC_FILE"
-	EnvPassphrase      = "TEE_MNEMONIC_PASSPHRASE"
-	EnvAccountRootPath = "TEE_ACCOUNT_ROOT_PATH"
-	EnvListenAddr      = "TEE_LISTEN_ADDR"
-	EnvDataFile        = "TEE_DATA_FILE"
-	EnvMaxUnlocks      = "TEE_MAX_CONCURRENT_UNLOCKS"
+	EnvMnemonic          = "TEE_MNEMONIC"
+	EnvMnemonicFile      = "TEE_MNEMONIC_FILE"
+	EnvPassphrase        = "TEE_MNEMONIC_PASSPHRASE"
+	EnvAccountRootPath   = "TEE_ACCOUNT_ROOT_PATH"
+	EnvListenAddr        = "TEE_LISTEN_ADDR"
+	EnvDataFile          = "TEE_DATA_FILE"
+	EnvMaxUnlocks        = "TEE_MAX_CONCURRENT_UNLOCKS"
+	EnvAdminToken        = "TEE_ADMIN_TOKEN"
+	EnvMaxAccounts       = "TEE_MAX_ACCOUNTS"
+	EnvAllowPublicListen = "TEE_ALLOW_PUBLIC_LISTEN"
 )
 
 // 默认值。监听地址默认只绑回环：TEE 上不该把托管接口直接暴露到公网。
@@ -37,6 +41,9 @@ type Config struct {
 	ListenAddr           string
 	DataFile             string
 	MaxConcurrentUnlocks int
+	AdminToken           string
+	MaxAccounts          uint32
+	AllowPublicListen    bool
 }
 
 // FromEnv 读取配置。缺失或冲突的配置一律直接报错，不做任何兜底默认 —— 尤其是助记词，
@@ -55,6 +62,15 @@ func FromEnv() (Config, error) {
 		}
 	}
 
+	maxAccounts := uint32(0)
+	if raw := strings.TrimSpace(os.Getenv(EnvMaxAccounts)); raw != "" {
+		value, parseErr := strconv.ParseUint(raw, 10, 32)
+		if parseErr != nil || value < 1 {
+			return Config{}, fmt.Errorf("%s 必须是正整数，实际 %q", EnvMaxAccounts, raw)
+		}
+		maxAccounts = uint32(value)
+	}
+
 	cfg := Config{
 		Mnemonic:             mnemonic,
 		MnemonicPassphrase:   os.Getenv(EnvPassphrase),
@@ -62,6 +78,9 @@ func FromEnv() (Config, error) {
 		ListenAddr:           strings.TrimSpace(os.Getenv(EnvListenAddr)),
 		DataFile:             strings.TrimSpace(os.Getenv(EnvDataFile)),
 		MaxConcurrentUnlocks: maxUnlocks,
+		AdminToken:           os.Getenv(EnvAdminToken),
+		MaxAccounts:          maxAccounts,
+		AllowPublicListen:    strings.TrimSpace(os.Getenv(EnvAllowPublicListen)) == "1",
 	}
 	if cfg.ListenAddr == "" {
 		cfg.ListenAddr = DefaultListenAddr
@@ -72,7 +91,27 @@ func FromEnv() (Config, error) {
 	if cfg.AccountRootPath == "" {
 		cfg.AccountRootPath = wallet.DefaultAccountRootPath
 	}
+	// 本服务没有客户端认证，绑到非回环等于把密码爆破面直接打开；必须显式放行。
+	if !cfg.AllowPublicListen && !isLoopback(cfg.ListenAddr) {
+		return Config{}, fmt.Errorf("%s=%q 不是回环地址；本服务没有客户端认证，"+
+			"必须显式设置 %s=1 才允许绑定非回环接口",
+			EnvListenAddr, cfg.ListenAddr, EnvAllowPublicListen)
+	}
 	return cfg, nil
+}
+
+// isLoopback 判断监听地址是否绑定回环接口。注意 ":8080" 这种省略 host 的写法
+// 会监听所有接口，不算回环。
+func isLoopback(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // readMnemonic 从 TEE_MNEMONIC 或 TEE_MNEMONIC_FILE 读取助记词。

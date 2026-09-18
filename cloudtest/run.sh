@@ -83,12 +83,15 @@ test() {
   remote_exec "$ip" "chmod +x $rem/tee-accounts-test/tee $rem/tee-accounts-test/run-all.sh"
 
   # 助记词由 config.py 统一提供（公开的测试助记词），不让它散落在多个脚本里。
+  # 走 ssh 的 stdin 注入：不进命令行，实例上的 ps 看不到；远端脚本负责落成
+  # 权限收紧的文件。
   local mnemonic
   mnemonic="$("$PY" -c 'import config; print(config.TEST_MNEMONIC)')"
 
   log "在实例上跑远端套件"
   local remote_status=0
-  remote_exec "$ip" "TEE_TEST_MNEMONIC='$mnemonic' bash $rem/tee-accounts-test/run-all.sh" \
+  printf '%s\n' "$mnemonic" | remote_exec "$ip" \
+    "TEE_TEST_MNEMONIC_STDIN=1 bash $rem/tee-accounts-test/run-all.sh" \
     | tee "$LOG_DIR/remote.log" || remote_status=1
 
   log "把结果拉回本地"

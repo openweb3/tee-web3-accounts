@@ -26,8 +26,13 @@ fail() {
   STATUS=1
 }
 
+# 助记词由编排器通过 ssh stdin 注入（不进命令行/环境变量，实例 ps 里不可见）。
+# 也保留 TEE_TEST_MNEMONIC 环境变量形式，方便本地手动调试。
+if [ "${TEE_TEST_MNEMONIC_STDIN:-}" = "1" ]; then
+  read -r TEE_TEST_MNEMONIC || exit 1
+fi
 if [ -z "${TEE_TEST_MNEMONIC:-}" ]; then
-  echo "!! 缺少 TEE_TEST_MNEMONIC（由编排器从 cloudtest/config.py 传入）"
+  echo "!! 缺少助记词（由编排器从 stdin 注入，或设置 TEE_TEST_MNEMONIC）"
   exit 1
 fi
 
@@ -133,7 +138,9 @@ grep -q "校验和" "$RESULTS/guard-checksum.log" || fail "护栏日志没有指
 
 echo "==> 打包结果"
 cp "$WORK/accounts.json" "$RESULTS/accounts.json"
-chmod 644 "$RESULTS"/*
+# accounts.json 含密码验证子，权限单独收紧；其余证据/日志文件放开。
+chmod 644 "$RESULTS"/tee-evidence.txt "$RESULTS"/tee.log "$RESULTS"/guard-*.log
+chmod 600 "$RESULTS/accounts.json"
 tar czf "$HOME/tee-accounts-results.tar.gz" -C "$HOME" tee-accounts-results
 
 if [ "$STATUS" -eq 0 ]; then

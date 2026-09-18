@@ -2,7 +2,6 @@ package store
 
 import (
 	"crypto/rand"
-	"crypto/subtle"
 	"errors"
 	"fmt"
 
@@ -85,17 +84,16 @@ func hashPassword(password string, params Argon2Params) (PasswordHash, error) {
 	}, nil
 }
 
-// matches 用记录里自带的参数重新派生并做常数时间比较。
-func (h PasswordHash) matches(password string) bool {
-	if h.Algorithm != algorithmArgon2id || h.validate() != nil {
-		return false
-	}
+// dummySalt 是「索引不存在」时跑等价 Argon2 用的固定盐。校验结果无人使用，
+// 只为了把耗时拉到与真实校验同一个量级，抹平「索引不存在」与「密码错误」的时序差。
+var dummySalt = []byte("tee-dummy-salt-0")
 
+// dummyVerify 在索引不存在时跑一次等价的 Argon2。
+func dummyVerify(password string, params Argon2Params) {
 	passwordBytes := []byte(password)
 	defer zero(passwordBytes)
-	key := argon2.IDKey(passwordBytes, h.Salt, h.Time, h.MemoryKiB, h.Threads, uint32(len(h.Key)))
+	key := argon2.IDKey(passwordBytes, dummySalt, params.Time, params.MemoryKiB, params.Threads, params.KeyLength)
 	defer zero(key)
-	return subtle.ConstantTimeCompare(key, h.Key) == 1
 }
 
 func (h PasswordHash) validate() error {

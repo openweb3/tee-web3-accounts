@@ -22,6 +22,10 @@ const maxRequestBodyBytes = 8 << 10
 type Config struct {
 	Wallet *wallet.Wallet
 	Store  *store.Store
+	// AdminToken 可选。设置后创建账户必须带 Authorization: Bearer <token>；
+	// 不设置时创建接口保持开放（向后兼容，也便于本地开发）。签名接口不受它约束，
+	// 签名只认账户密码。
+	AdminToken string
 	// MaxConcurrentUnlocks 限制同时进行的密码校验数量。
 	//
 	// 每次校验都要分配 64 MiB 内存做 Argon2id，不设上限的话并发请求会把 TEE 打爆；
@@ -33,11 +37,17 @@ type Config struct {
 // DefaultMaxConcurrentUnlocks 是默认的并发密码校验上限。
 const DefaultMaxConcurrentUnlocks = 4
 
+// DefaultMaxConcurrentCreates 是创建账户的并发上限。创建也要跑 Argon2 且会写盘，
+// 但与签名分开设池，避免无凭据的创建请求把签名接口饿死。
+const DefaultMaxConcurrentCreates = 2
+
 // Server 实现三个核心接口。
 type Server struct {
-	wallet  *wallet.Wallet
-	store   *store.Store
-	unlocks chan struct{}
+	wallet     *wallet.Wallet
+	store      *store.Store
+	adminToken string
+	unlocks    chan struct{}
+	creates    chan struct{}
 }
 
 // New 校验依赖并构造服务。
@@ -54,9 +64,11 @@ func New(cfg Config) (*Server, error) {
 		limit = DefaultMaxConcurrentUnlocks
 	}
 	return &Server{
-		wallet:  cfg.Wallet,
-		store:   cfg.Store,
-		unlocks: make(chan struct{}, limit),
+		wallet:     cfg.Wallet,
+		store:      cfg.Store,
+		adminToken: cfg.AdminToken,
+		unlocks:    make(chan struct{}, limit),
+		creates:    make(chan struct{}, DefaultMaxConcurrentCreates),
 	}, nil
 }
 
@@ -71,11 +83,11 @@ func (s *Server) Handler() http.Handler {
 	return recoverPanic(logRequests(mux))
 }
 
-// tryAcquireUnlock 尝试占用一个密码校验额度，拿不到就立刻返回 false（不排队）。
-func (s *Server) tryAcquireUnlock() (release func(), ok bool) {
+// tryAcquire 尝试占用一个并发名额，拿不到就立刻返回 false（不排队）。
+func tryAcquire(slots chan struct{}) (release func(), ok bool) {
 	select {
-	case s.unlocks <- struct{}{}:
-		return func() { <-s.unlocks }, true
+	case slots <- struct{}{}:
+		return func() { <-slots }, true
 	default:
 		return nil, false
 	}
