@@ -1,0 +1,185 @@
+package api
+
+import (
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"strings"
+	"unicode/utf8"
+
+	"github.com/openweb3/tee-web3-accounts/internal/store"
+)
+
+// 密码策略。密码是这套服务上唯一的身份凭据，同时也是解锁私钥的唯一钥匙，
+// 所以设一个下限；上限则是为了给 Argon2id 的输入长度封顶。
+const (
+	MinPasswordLength = 8
+	MaxPasswordLength = 1024
+)
+
+// handleHealth 供存活探针和部署脚本使用。
+func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// handleCreateAccount 创建账户：分配索引、实时派生地址、存下密码验证子。
+// 私钥既不落盘也不返回，服务端自己也不留。
+func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
+	var request createAccountRequest
+	if err := decodeJSON(w, r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := validatePassword(request.Password); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	release, ok := s.tryAcquireUnlock()
+	if !ok {
+		writeUnavailable(w)
+		return
+	}
+	defer release()
+
+	account, err := s.store.Create(request.Password, s.wallet.Address)
+	if err != nil {
+		slog.Error("创建账户失败", "error", err)
+		writeError(w, http.StatusInternalServerError, "创建账户失败")
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, accountResponse{
+		Index:   account.Index,
+		Path:    s.wallet.AccountPath(account.Index),
+		Address: account.Address,
+	})
+}
+
+// handleGetAccount 按索引查询地址。地址是公开信息，不需要密码。
+func (s *Server) handleGetAccount(w http.ResponseWriter, r *http.Request) {
+	index, err := parseUint32(r.PathValue("index"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	account, ok := s.store.Get(index)
+	if !ok {
+		writeError(w, http.StatusNotFound, "账户不存在")
+		return
+	}
+
+	// 地址一律现场派生，账户库里那份只作助记词一致性护栏。
+	address, err := s.wallet.Address(index)
+	if err != nil {
+		slog.Error("派生地址失败", "index", index, "error", err)
+		writeError(w, http.StatusInternalServerError, "派生地址失败")
+		return
+	}
+	if address != account.Address {
+		slog.Error("地址与账户库不一致，助记词可能被换过",
+			"index", index, "expected", account.Address, "derived", address)
+		writeError(w, http.StatusInternalServerError, "服务端助记词与账户库不一致")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, accountResponse{
+		Index:   index,
+		Path:    s.wallet.AccountPath(index),
+		Address: address,
+	})
+}
+
+// handleSign 用指定账户对 32 字节哈希签名。
+//
+// 密码在这里只做身份校验；私钥不带密码因素，由助记词 + 索引现场派生，签完立刻抹掉。
+func (s *Server) handleSign(w http.ResponseWriter, r *http.Request) {
+	var request signRequest
+	if err := decodeJSON(w, r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	hash, err := parseHash(request.Hash)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	release, ok := s.tryAcquireUnlock()
+	if !ok {
+		writeUnavailable(w)
+		return
+	}
+	defer release()
+
+	if err := s.store.VerifyPassword(request.Index, request.Password); err != nil {
+		// ErrUnauthorized 之外的错误说明账户库本身有问题，要区分开。
+		if !errors.Is(err, store.ErrUnauthorized) {
+			slog.Error("校验密码失败", "index", request.Index, "error", err)
+			writeError(w, http.StatusInternalServerError, "校验密码失败")
+			return
+		}
+		writeError(w, http.StatusUnauthorized, "索引或密码不正确")
+		return
+	}
+
+	account, err := s.wallet.Account(request.Index)
+	if err != nil {
+		slog.Error("派生账户失败", "index", request.Index, "error", err)
+		writeError(w, http.StatusInternalServerError, "派生账户失败")
+		return
+	}
+	defer account.Destroy()
+
+	signature, err := account.Sign(hash)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, signResponse{
+		Index:     request.Index,
+		Path:      account.Path,
+		Address:   account.Address,
+		Hash:      "0x" + hex.EncodeToString(hash),
+		Signature: "0x" + hex.EncodeToString(signature),
+	})
+}
+
+// writeUnavailable 在密码校验通道打满时回背压，让客户端稍后重试。
+func writeUnavailable(w http.ResponseWriter) {
+	w.Header().Set("Retry-After", "1")
+	writeError(w, http.StatusServiceUnavailable, "服务繁忙，请稍后重试")
+}
+
+// validatePassword 只用于创建账户时执行密码策略；校验已有密码时不走这里。
+func validatePassword(password string) error {
+	switch {
+	case password == "":
+		return errors.New("密码不能为空")
+	case utf8.RuneCountInString(password) < MinPasswordLength:
+		return fmt.Errorf("密码至少 %d 个字符", MinPasswordLength)
+	case len(password) > MaxPasswordLength:
+		return fmt.Errorf("密码最多 %d 字节", MaxPasswordLength)
+	}
+	return nil
+}
+
+// parseHash 解析待签名的哈希，接受带或不带 0x 前缀的 64 位十六进制字符串。
+func parseHash(raw string) ([]byte, error) {
+	trimmed := strings.TrimSpace(raw)
+	if len(trimmed) >= 2 && (trimmed[:2] == "0x" || trimmed[:2] == "0X") {
+		trimmed = trimmed[2:]
+	}
+	hash, err := hex.DecodeString(trimmed)
+	if err != nil {
+		return nil, errors.New("hash 必须是十六进制字符串")
+	}
+	if len(hash) != 32 {
+		return nil, fmt.Errorf("hash 必须是 32 字节（64 个十六进制字符），实际 %d 字节", len(hash))
+	}
+	return hash, nil
+}

@@ -1,0 +1,130 @@
+// Package config 从环境变量读取 TEE 服务的启动配置。
+package config
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"strconv"
+	"strings"
+
+	"github.com/openweb3/tee-web3-accounts/internal/wallet"
+)
+
+// 配置项名。用环境变量而不是配置文件，是为了让部署脚本（含 cloudtest）能直接注入，
+// 且助记词可以只经过一次内存传递。
+const (
+	EnvMnemonic        = "TEE_MNEMONIC"
+	EnvMnemonicFile    = "TEE_MNEMONIC_FILE"
+	EnvPassphrase      = "TEE_MNEMONIC_PASSPHRASE"
+	EnvAccountRootPath = "TEE_ACCOUNT_ROOT_PATH"
+	EnvListenAddr      = "TEE_LISTEN_ADDR"
+	EnvDataFile        = "TEE_DATA_FILE"
+	EnvMaxUnlocks      = "TEE_MAX_CONCURRENT_UNLOCKS"
+)
+
+// 默认值。监听地址默认只绑回环：TEE 上不该把托管接口直接暴露到公网。
+const (
+	DefaultListenAddr = "127.0.0.1:8080"
+	DefaultDataFile   = "data/accounts.json"
+)
+
+// Config 是服务启动所需的全部配置。
+type Config struct {
+	Mnemonic             string
+	MnemonicPassphrase   string
+	AccountRootPath      string
+	ListenAddr           string
+	DataFile             string
+	MaxConcurrentUnlocks int
+}
+
+// FromEnv 读取配置。缺失或冲突的配置一律直接报错，不做任何兜底默认 —— 尤其是助记词，
+// 给默认值等于把所有人的资产都交给一个公开的种子。
+func FromEnv() (Config, error) {
+	mnemonic, err := readMnemonic()
+	if err != nil {
+		return Config{}, err
+	}
+
+	maxUnlocks := 0
+	if raw := strings.TrimSpace(os.Getenv(EnvMaxUnlocks)); raw != "" {
+		maxUnlocks, err = strconv.Atoi(raw)
+		if err != nil || maxUnlocks < 1 {
+			return Config{}, fmt.Errorf("%s 必须是正整数，实际 %q", EnvMaxUnlocks, raw)
+		}
+	}
+
+	cfg := Config{
+		Mnemonic:             mnemonic,
+		MnemonicPassphrase:   os.Getenv(EnvPassphrase),
+		AccountRootPath:      strings.TrimSpace(os.Getenv(EnvAccountRootPath)),
+		ListenAddr:           strings.TrimSpace(os.Getenv(EnvListenAddr)),
+		DataFile:             strings.TrimSpace(os.Getenv(EnvDataFile)),
+		MaxConcurrentUnlocks: maxUnlocks,
+	}
+	if cfg.ListenAddr == "" {
+		cfg.ListenAddr = DefaultListenAddr
+	}
+	if cfg.DataFile == "" {
+		cfg.DataFile = DefaultDataFile
+	}
+	if cfg.AccountRootPath == "" {
+		cfg.AccountRootPath = wallet.DefaultAccountRootPath
+	}
+	return cfg, nil
+}
+
+// readMnemonic 从 TEE_MNEMONIC 或 TEE_MNEMONIC_FILE 读取助记词。
+//
+// 文件形式适合把助记词放在权限收紧的文件里，避免出现在进程环境变量中。
+func readMnemonic() (string, error) {
+	inline := strings.TrimSpace(os.Getenv(EnvMnemonic))
+	file := strings.TrimSpace(os.Getenv(EnvMnemonicFile))
+
+	switch {
+	case inline != "" && file != "":
+		return "", fmt.Errorf("%s 与 %s 只能设置一个", EnvMnemonic, EnvMnemonicFile)
+	case inline != "":
+		return inline, nil
+	case file != "":
+		raw, err := os.ReadFile(file)
+		if err != nil {
+			return "", fmt.Errorf("读取 %s 指定的助记词文件失败: %w", EnvMnemonicFile, err)
+		}
+		mnemonic := strings.TrimSpace(string(raw))
+		if mnemonic == "" {
+			return "", fmt.Errorf("%s 指定的文件 %s 是空的", EnvMnemonicFile, file)
+		}
+		return mnemonic, nil
+	default:
+		return "", fmt.Errorf("必须通过 %s 或 %s 配置助记词", EnvMnemonic, EnvMnemonicFile)
+	}
+}
+
+// WalletConfig 转成钱包的构造参数。
+func (c Config) WalletConfig() wallet.Config {
+	return wallet.Config{
+		Mnemonic:        c.Mnemonic,
+		Passphrase:      c.MnemonicPassphrase,
+		AccountRootPath: c.AccountRootPath,
+	}
+}
+
+// Validate 做一次自检，确保配置项本身自洽。
+// 并发上限为 0 表示「用 API 层的默认值」，不算错误。
+func (c Config) Validate() error {
+	if strings.TrimSpace(c.Mnemonic) == "" {
+		return errors.New("config: 助记词不能为空")
+	}
+	if strings.TrimSpace(c.ListenAddr) == "" {
+		return errors.New("config: 监听地址不能为空")
+	}
+	if strings.TrimSpace(c.DataFile) == "" {
+		return errors.New("config: 账户库路径不能为空")
+	}
+	if c.MaxConcurrentUnlocks < 0 {
+		return fmt.Errorf("config: 并发校验上限不能为负，实际 %d", c.MaxConcurrentUnlocks)
+	}
+	return nil
+}

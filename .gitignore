@@ -1,0 +1,15 @@
+# 构建产物
+/bin/
+
+# 运行时数据：账户库里有密码验证子，绝不入库
+/data/
+
+# cloudtest 的临时状态、密钥与日志
+/cloudtest/.env
+/cloudtest/*.pem
+/cloudtest/hosts.json
+/cloudtest/logs/
+/cloudtest/bin/
+/cloudtest/.venv/
+/cloudtest/__pycache__/
+/cloudtest/**/__pycache__/
