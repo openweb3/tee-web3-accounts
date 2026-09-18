@@ -97,7 +97,8 @@ func FromEnv() (Config, error) {
 			"必须显式设置 %s=1 才允许绑定非回环接口",
 			EnvListenAddr, cfg.ListenAddr, EnvAllowPublicListen)
 	}
-	return cfg, nil
+	// 解析与完整性校验收敛到这一个入口，调用方无需再单独调 Validate。
+	return cfg, cfg.Validate()
 }
 
 // isLoopback 判断监听地址是否绑定回环接口。注意 ":8080" 这种省略 host 的写法

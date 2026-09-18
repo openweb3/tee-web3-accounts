@@ -36,9 +36,6 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	if err := cfg.Validate(); err != nil {
-		return err
-	}
 
 	// 助记词在这里被完整校验（词表 + 校验和）；配错就拒绝启动，而不是起一个
 	// 会派生错地址的服务。
