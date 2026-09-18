@@ -217,26 +217,10 @@ func (s *Store) Len() int {
 func (s *Store) Get(index uint32) (Account, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.getLocked(index)
-}
-
-func (s *Store) getLocked(index uint32) (Account, bool) {
 	if index >= s.data.NextIndex {
 		return Account{}, false
 	}
 	return s.data.Accounts[index], true
-}
-
-// Each 按索引顺序遍历所有账户，回调必须把参数当作只读，且不得持有引用。
-func (s *Store) Each(fn func(Account) error) error {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	for _, account := range s.data.Accounts {
-		if err := fn(account); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 // Create 分配下一个索引，用 derive 生成地址，连同密码验证子一起落盘。

@@ -303,33 +303,6 @@ func TestConcurrentCreateKeepsIndicesUnique(t *testing.T) {
 	}
 }
 
-func TestEachVisitsEveryAccountInOrder(t *testing.T) {
-	t.Parallel()
-
-	s, _ := openTemp(t)
-	for range 3 {
-		if _, err := s.Create("correct horse battery", fakeAddress); err != nil {
-			t.Fatalf("Create: %v", err)
-		}
-	}
-
-	var indices []uint32
-	if err := s.Each(func(account Account) error {
-		indices = append(indices, account.Index)
-		return nil
-	}); err != nil {
-		t.Fatalf("Each: %v", err)
-	}
-	if fmt.Sprint(indices) != "[0 1 2]" {
-		t.Errorf("遍历顺序 = %v", indices)
-	}
-
-	stop := errors.New("停")
-	if err := s.Each(func(Account) error { return stop }); !errors.Is(err, stop) {
-		t.Errorf("Each 应当透传回调错误, got %v", err)
-	}
-}
-
 func TestDefaultParamsAreUsable(t *testing.T) {
 	t.Parallel()
 

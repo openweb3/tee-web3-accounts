@@ -30,7 +30,7 @@ var testAddresses = []string{
 // fastParams 压低 Argon2id 代价，让接口测试跑得快。
 var fastParams = store.Argon2Params{Time: 1, MemoryKiB: 64, Threads: 1, KeyLength: 32}
 
-func newTestHandler(t *testing.T, maxUnlocks int) http.Handler {
+func newTestHandler(t *testing.T) http.Handler {
 	t.Helper()
 
 	accountWallet, err := wallet.Open(wallet.Config{Mnemonic: testMnemonic})
@@ -41,7 +41,7 @@ func newTestHandler(t *testing.T, maxUnlocks int) http.Handler {
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	server, err := New(Config{Wallet: accountWallet, Store: accountStore, MaxConcurrentUnlocks: maxUnlocks})
+	server, err := New(Config{Wallet: accountWallet, Store: accountStore})
 	if err != nil {
 		t.Fatalf("api.New: %v", err)
 	}
@@ -76,21 +76,20 @@ func decode(t *testing.T, raw string) map[string]any {
 	return payload
 }
 
-// createAccount 建一个账户并返回其索引。
-func createAccount(t *testing.T, handler http.Handler) uint32 {
+// createAccount 建一个账户，断言创建成功。
+func createAccount(t *testing.T, handler http.Handler) {
 	t.Helper()
 	status, body, _ := request(t, handler, http.MethodPost, "/v1/accounts",
 		fmt.Sprintf(`{"password":%q}`, testPassword))
 	if status != http.StatusCreated {
 		t.Fatalf("创建账户状态码 = %d, body = %s", status, body)
 	}
-	return uint32(decode(t, body)["index"].(float64))
 }
 
 func TestHealth(t *testing.T) {
 	t.Parallel()
 
-	status, body, _ := request(t, newTestHandler(t, 0), http.MethodGet, "/healthz", "")
+	status, body, _ := request(t, newTestHandler(t), http.MethodGet, "/healthz", "")
 	if status != http.StatusOK {
 		t.Fatalf("状态码 = %d, body = %s", status, body)
 	}
@@ -102,7 +101,7 @@ func TestHealth(t *testing.T) {
 func TestCreateAccountReturnsDerivedAddress(t *testing.T) {
 	t.Parallel()
 
-	handler := newTestHandler(t, 0)
+	handler := newTestHandler(t)
 	for index, wantAddress := range testAddresses {
 		status, body, header := request(t, handler, http.MethodPost, "/v1/accounts",
 			fmt.Sprintf(`{"password":%q}`, testPassword))
@@ -130,7 +129,7 @@ func TestCreateAccountReturnsDerivedAddress(t *testing.T) {
 func TestCreateAccountValidatesPassword(t *testing.T) {
 	t.Parallel()
 
-	handler := newTestHandler(t, 0)
+	handler := newTestHandler(t)
 	for _, password := range []string{"", "short", strings.Repeat("a", MaxPasswordLength+1)} {
 		status, body, _ := request(t, handler, http.MethodPost, "/v1/accounts",
 			fmt.Sprintf(`{"password":%q}`, password))
@@ -143,7 +142,7 @@ func TestCreateAccountValidatesPassword(t *testing.T) {
 func TestCreateAccountRejectsMalformedBody(t *testing.T) {
 	t.Parallel()
 
-	handler := newTestHandler(t, 0)
+	handler := newTestHandler(t)
 	tests := []struct {
 		name string
 		body string
@@ -167,7 +166,7 @@ func TestCreateAccountRejectsMalformedBody(t *testing.T) {
 func TestGetAccount(t *testing.T) {
 	t.Parallel()
 
-	handler := newTestHandler(t, 0)
+	handler := newTestHandler(t)
 	createAccount(t, handler)
 	createAccount(t, handler)
 
@@ -200,7 +199,7 @@ func TestGetAccount(t *testing.T) {
 func TestGetAccountNeedsNoPassword(t *testing.T) {
 	t.Parallel()
 
-	handler := newTestHandler(t, 0)
+	handler := newTestHandler(t)
 	createAccount(t, handler)
 
 	status, body, _ := request(t, handler, http.MethodGet, "/v1/accounts/0", "")
@@ -212,7 +211,7 @@ func TestGetAccountNeedsNoPassword(t *testing.T) {
 func TestSign(t *testing.T) {
 	t.Parallel()
 
-	handler := newTestHandler(t, 0)
+	handler := newTestHandler(t)
 	createAccount(t, handler)
 
 	hash := "0x" + strings.Repeat("ab", 32)
@@ -253,7 +252,7 @@ func TestSign(t *testing.T) {
 func TestSignAcceptsBareHash(t *testing.T) {
 	t.Parallel()
 
-	handler := newTestHandler(t, 0)
+	handler := newTestHandler(t)
 	createAccount(t, handler)
 
 	body := fmt.Sprintf(`{"index":0,"password":%q,"hash":%q}`, testPassword, strings.Repeat("cd", 32))
@@ -269,7 +268,7 @@ func TestSignAcceptsBareHash(t *testing.T) {
 func TestSignRejectsBadInput(t *testing.T) {
 	t.Parallel()
 
-	handler := newTestHandler(t, 0)
+	handler := newTestHandler(t)
 	createAccount(t, handler)
 
 	validHash := strings.Repeat("ab", 32)
@@ -305,7 +304,7 @@ func TestSignRejectsBadInput(t *testing.T) {
 func TestSignWrongPasswordDoesNotRevealIndexExistence(t *testing.T) {
 	t.Parallel()
 
-	handler := newTestHandler(t, 0)
+	handler := newTestHandler(t)
 	createAccount(t, handler)
 
 	validHash := strings.Repeat("ab", 32)
@@ -328,7 +327,7 @@ func TestSignWrongPasswordDoesNotRevealIndexExistence(t *testing.T) {
 func TestPasswordKeyedByIndex(t *testing.T) {
 	t.Parallel()
 
-	handler := newTestHandler(t, 0)
+	handler := newTestHandler(t)
 	for _, password := range []string{"first-account-password", "second-account-passwd"} {
 		status, body, _ := request(t, handler, http.MethodPost, "/v1/accounts",
 			fmt.Sprintf(`{"password":%q}`, password))
@@ -452,7 +451,7 @@ func TestCreateRequiresAdminToken(t *testing.T) {
 func TestRoutingRejectsUnsupportedMethods(t *testing.T) {
 	t.Parallel()
 
-	handler := newTestHandler(t, 0)
+	handler := newTestHandler(t)
 	for _, tc := range []struct{ method, path string }{
 		{http.MethodGet, "/v1/accounts"},
 		{http.MethodDelete, "/v1/accounts/0"},
