@@ -56,7 +56,7 @@ func Open(cfg Config) (*Wallet, error) {
 	if err != nil {
 		return nil, fmt.Errorf("wallet: 派生种子失败: %w", err)
 	}
-	defer zero(seed)
+	defer clear(seed)
 
 	master, err := newMasterNode(seed)
 	if err != nil {
@@ -70,7 +70,7 @@ func Open(cfg Config) (*Wallet, error) {
 	// 账户根节点是独立派生出来的，主私钥与主链码用完立刻抹掉。
 	if root != master {
 		master.key.Zero()
-		zero(master.code[:])
+		clear(master.code[:])
 	}
 
 	return &Wallet{root: root, rootPath: rootPath}, nil
@@ -164,13 +164,6 @@ func RecoverAddress(hash, signature []byte) (string, error) {
 		return "", fmt.Errorf("wallet: 恢复公钥失败: %w", err)
 	}
 	return addressFromPubKey(pub), nil
-}
-
-// zero 覆写字节切片。
-func zero(b []byte) {
-	for i := range b {
-		b[i] = 0
-	}
 }
 
 // isASCII 检查字符串是否全部是 ASCII 字符。BIP-39 额外口令若含非 ASCII 字符，

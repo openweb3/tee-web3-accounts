@@ -30,7 +30,7 @@ func newMasterNode(seed []byte) (*bip32Node, error) {
 	mac := hmac.New(sha512.New, []byte("Bitcoin seed"))
 	mac.Write(seed)
 	sum := mac.Sum(nil)
-	defer zero(sum)
+	defer clear(sum)
 
 	var left, code [32]byte
 	copy(left[:], sum[:32])
@@ -38,10 +38,10 @@ func newMasterNode(seed []byte) (*bip32Node, error) {
 
 	var scalar secp256k1.ModNScalar
 	if overflow := scalar.SetBytes(&left); overflow != 0 || scalar.IsZero() {
-		zero(left[:])
+		clear(left[:])
 		return nil, fmt.Errorf("%w: 种子不产生合法的主私钥", ErrDerive)
 	}
-	zero(left[:])
+	clear(left[:])
 	key := scalarToKey(&scalar)
 	scalar.Zero()
 	return &bip32Node{key: key, code: code}, nil
@@ -52,13 +52,13 @@ func (n *bip32Node) child(index uint32) (*bip32Node, error) {
 	// data = 0x00 || ser256(k_par) || ser32(i)   硬化
 	//      = serP(point(k_par)) || ser32(i)      非硬化
 	var data [37]byte
-	defer zero(data[:])
+	defer clear(data[:])
 
 	if index >= hardenedOffset {
 		var parentKey [32]byte
 		n.key.Key.PutBytes(&parentKey)
 		copy(data[1:33], parentKey[:])
-		zero(parentKey[:])
+		clear(parentKey[:])
 	} else {
 		copy(data[:33], n.key.PubKey().SerializeCompressed())
 	}
@@ -67,11 +67,11 @@ func (n *bip32Node) child(index uint32) (*bip32Node, error) {
 	mac := hmac.New(sha512.New, n.code[:])
 	mac.Write(data[:])
 	sum := mac.Sum(nil)
-	defer zero(sum)
+	defer clear(sum)
 
 	var left [32]byte
 	copy(left[:], sum[:32])
-	defer zero(left[:])
+	defer clear(left[:])
 	var code [32]byte
 	copy(code[:], sum[32:])
 
@@ -109,7 +109,7 @@ func (n *bip32Node) derivePath(path string) (*bip32Node, error) {
 		}
 		if node != n { // 入口节点归调用方所有，不在这里清理
 			node.key.Zero()
-			zero(node.code[:])
+			clear(node.code[:])
 		}
 		node = next
 	}
@@ -120,7 +120,7 @@ func (n *bip32Node) derivePath(path string) (*bip32Node, error) {
 // 硬化标记接受 '、h、H 三种写法。
 func parsePath(path string) ([]uint32, error) {
 	parts := strings.Split(path, "/")
-	if len(parts) == 0 || (parts[0] != "m" && parts[0] != "M") {
+	if parts[0] != "m" && parts[0] != "M" {
 		return nil, fmt.Errorf("wallet: 派生路径 %q 必须以 m 开头", path)
 	}
 
@@ -150,6 +150,6 @@ func parsePath(path string) ([]uint32, error) {
 func scalarToKey(scalar *secp256k1.ModNScalar) *secp256k1.PrivateKey {
 	var raw [32]byte
 	scalar.PutBytes(&raw)
-	defer zero(raw[:])
+	defer clear(raw[:])
 	return secp256k1.PrivKeyFromBytes(raw[:])
 }

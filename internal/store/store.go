@@ -306,6 +306,9 @@ func (s *Store) VerifyPassword(index uint32, password string) error {
 		return ErrUnauthorized
 	}
 	if retryAfter, locked := s.checkLockout(index); locked {
+		// 锁定分支同样要跑等价 Argon2：否则「已锁定的存在索引」微秒级返回、
+		// 「不存在的索引」毫秒级返回，时序就重新变成存在性预言机。
+		dummyVerify(password, s.params)
 		return &LockoutError{RetryAfter: retryAfter}
 	}
 	if s.hashMatches(account.PasswordHash, password) {
@@ -331,9 +334,9 @@ func (s *Store) hashMatches(h PasswordHash, password string) bool {
 	}
 
 	passwordBytes := []byte(password)
-	defer zero(passwordBytes)
+	defer clear(passwordBytes)
 	key := argon2.IDKey(passwordBytes, h.Salt, h.Time, h.MemoryKiB, h.Threads, uint32(len(h.Key)))
-	defer zero(key)
+	defer clear(key)
 	return subtle.ConstantTimeCompare(key, h.Key) == 1
 }
 

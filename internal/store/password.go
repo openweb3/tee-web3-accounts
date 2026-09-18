@@ -71,7 +71,7 @@ func hashPassword(password string, params Argon2Params) (PasswordHash, error) {
 	}
 
 	passwordBytes := []byte(password)
-	defer zero(passwordBytes)
+	defer clear(passwordBytes)
 	key := argon2.IDKey(passwordBytes, salt, params.Time, params.MemoryKiB, params.Threads, params.KeyLength)
 
 	return PasswordHash{
@@ -91,9 +91,9 @@ var dummySalt = []byte("tee-dummy-salt-0")
 // dummyVerify 在索引不存在时跑一次等价的 Argon2。
 func dummyVerify(password string, params Argon2Params) {
 	passwordBytes := []byte(password)
-	defer zero(passwordBytes)
+	defer clear(passwordBytes)
 	key := argon2.IDKey(passwordBytes, dummySalt, params.Time, params.MemoryKiB, params.Threads, params.KeyLength)
-	defer zero(key)
+	defer clear(key)
 }
 
 func (h PasswordHash) validate() error {
@@ -112,11 +112,4 @@ func (h PasswordHash) validate() error {
 		Threads:   h.Threads,
 		KeyLength: uint32(len(h.Key)),
 	}.validate()
-}
-
-// zero 覆写字节切片。
-func zero(b []byte) {
-	for i := range b {
-		b[i] = 0
-	}
 }
