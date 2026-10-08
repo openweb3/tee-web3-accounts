@@ -104,12 +104,13 @@ func (n *bip32Node) derivePath(path string) (*bip32Node, error) {
 	node := n
 	for _, index := range indices {
 		next, err := node.child(index)
-		if err != nil {
-			return nil, err
-		}
-		if node != n { // 入口节点归调用方所有，不在这里清理
+		// 无论成败，本轮派生出的中间节点都不再需要（入口节点归调用方，不清）。
+		if node != n {
 			node.key.Zero()
 			clear(node.code[:])
+		}
+		if err != nil {
+			return nil, err
 		}
 		node = next
 	}

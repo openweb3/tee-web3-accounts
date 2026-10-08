@@ -736,6 +736,40 @@ func TestVerifyPasswordRehashesToCurrentParams(t *testing.T) {
 	}
 }
 
+// TestRehashDoesNotDowngrade 确认调低配置不会把老记录降级：登录一次强度降一档
+// 的方向是反的。校验仍按记录自带参数走，但成功后不重写为更弱的参数。
+func TestRehashDoesNotDowngrade(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "accounts.json")
+	strong := Argon2Params{Time: 2, MemoryKiB: 128, Threads: 2, KeyLength: 32}
+	s, err := Open(path, strong, testIntegrityKey)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if _, err := s.Create("correct horse battery", fakeAddress); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	weaker := Argon2Params{Time: 1, MemoryKiB: 64, Threads: 1, KeyLength: 32}
+	downgraded, err := Open(path, weaker, testIntegrityKey)
+	if err != nil {
+		t.Fatalf("降配后打开失败: %v", err)
+	}
+	defer downgraded.Close()
+	if err := downgraded.VerifyPassword(0, "correct horse battery"); err != nil {
+		t.Fatalf("降配后校验失败: %v", err)
+	}
+	after, _ := downgraded.Get(0)
+	if after.PasswordHash.Time != strong.Time || after.PasswordHash.MemoryKiB != strong.MemoryKiB {
+		t.Errorf("降配后记录被降级: t=%d m=%d, want 保持 t=%d m=%d",
+			after.PasswordHash.Time, after.PasswordHash.MemoryKiB, strong.Time, strong.MemoryKiB)
+	}
+}
+
 // TestCreateAtCeilingStaysVerifiable 是 P1 的回归：以前配置能顶到 1 GiB、校验只认
 // 256 MiB，运维把参数配高后新建的账户会在每次校验时被 ceiling 判为「密码错误」，
 // 正确密码永远 401 且没有日志指向真因。现在两套上限收敛成一套，按 ceiling 顶格

@@ -402,7 +402,9 @@ func (s *Store) hashMatches(h PasswordHash, password string) bool {
 // rehashLocked 在密码校验成功后，把代价参数落后的记录按当前配置重新派生并落盘。
 //
 // 有了它，调高 Argon2 代价不需要重置所有用户的密码：每个用户下次成功登录时，
-// 自己那条记录就升级了。调低配置同理，不会再把老账户挡在门外。
+// 自己那条记录就升级了。调低配置不会再把老账户挡在门外（校验按记录自带参数走），
+// 但也不会把老记录降级——只在三项代价都不低于记录时才重写，否则「登录一次
+// 强度降一档」的方向是反的。
 //
 // 任何失败都只记日志：rehash 是优化，不是安全边界，让它把已经成功的校验翻掉
 // 是本末倒置。
@@ -413,12 +415,14 @@ func (s *Store) rehashLocked(index uint32, password string) {
 		return
 	}
 	current := s.data.Accounts[index].PasswordHash
-	needs := current.Time != s.params.Time ||
-		current.MemoryKiB != s.params.MemoryKiB ||
-		current.Threads != s.params.Threads
 	s.mu.RUnlock()
 
-	if !needs {
+	stronger := s.params.Time >= current.Time &&
+		s.params.MemoryKiB >= current.MemoryKiB &&
+		s.params.Threads >= current.Threads
+	identical := s.params.Time == current.Time &&
+		s.params.MemoryKiB == current.MemoryKiB && s.params.Threads == current.Threads
+	if !stronger || identical {
 		return
 	}
 
