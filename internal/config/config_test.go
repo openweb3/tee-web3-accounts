@@ -192,6 +192,7 @@ func TestFromEnvAcceptsPublicListenWithFlag(t *testing.T) {
 	t.Setenv(EnvMnemonic, testMnemonic)
 	t.Setenv(EnvListenAddr, "0.0.0.0:8080")
 	t.Setenv(EnvAllowPublicListen, "1")
+	t.Setenv(EnvAdminToken, "secret")
 
 	cfg, err := FromEnv()
 	if err != nil {
@@ -199,6 +200,28 @@ func TestFromEnvAcceptsPublicListenWithFlag(t *testing.T) {
 	}
 	if cfg.ListenAddr != "0.0.0.0:8080" {
 		t.Errorf("ListenAddr = %q", cfg.ListenAddr)
+	}
+}
+
+// TestFromEnvRequiresAdminTokenOnPublicListen 覆盖：放行非回环监听还不够，创建接口
+// 必须有准入凭据，否则任何人都能无凭据做写放大。
+func TestFromEnvRequiresAdminTokenOnPublicListen(t *testing.T) {
+	clearEnv(t)
+	t.Setenv(EnvMnemonic, testMnemonic)
+	t.Setenv(EnvListenAddr, "0.0.0.0:8080")
+	t.Setenv(EnvAllowPublicListen, "1")
+	// 故意不配 AdminToken。
+
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("非回环监听未配 AdminToken 应当被拒绝")
+	} else if !strings.Contains(err.Error(), EnvAdminToken) {
+		t.Errorf("错误信息没有指明缺少 AdminToken: %v", err)
+	}
+
+	// 回环监听不受此约束（本地开发保持开放创建）。
+	t.Setenv(EnvListenAddr, "127.0.0.1:8080")
+	if _, err := FromEnv(); err != nil {
+		t.Errorf("回环监听未配 AdminToken 不该被拒绝: %v", err)
 	}
 }
 

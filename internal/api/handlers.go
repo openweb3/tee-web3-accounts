@@ -1,6 +1,7 @@
 package api
 
 import (
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
 	"errors"
@@ -73,12 +74,16 @@ func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 }
 
 // tokenMatches 常数时间比较 Authorization 头里的 Bearer token。
+// 先各自 SHA-256 再比较：定长摘要让 ConstantTimeCompare 覆盖全部内容，
+// 不必（也不该）用长度预比较提前短路——那会泄露 token 长度。
 func tokenMatches(want, header string) bool {
 	token, ok := strings.CutPrefix(header, "Bearer ")
-	if !ok || len(token) != len(want) {
+	if !ok {
 		return false
 	}
-	return subtle.ConstantTimeCompare([]byte(token), []byte(want)) == 1
+	wantSum := sha256.Sum256([]byte(want))
+	gotSum := sha256.Sum256([]byte(token))
+	return subtle.ConstantTimeCompare(wantSum[:], gotSum[:]) == 1
 }
 
 // handleGetAccount 按索引查询地址。地址是公开信息，不需要密码。

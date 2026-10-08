@@ -157,6 +157,14 @@ func FromEnv() (Config, error) {
 			"必须显式设置 %s=1 才允许绑定非回环接口",
 			EnvListenAddr, cfg.ListenAddr, EnvAllowPublicListen)
 	}
+	// 非回环监听时创建接口必须配准入凭据。AllowPublicListen 只放行「绑公网」这件事，
+	// 但开放创建 = 任何人都能用写盘请求做写放大 DoS；既然已经暴露到非回环，就必须有
+	// AdminToken 挡住无凭据创建，而不是靠文档口头约定「生产必须配置」。
+	if !isLoopback(cfg.ListenAddr) && cfg.AdminToken == "" {
+		return Config{}, fmt.Errorf("%s=%q 绑定非回环地址时必须配置 %s，"+
+			"否则任何人都能无凭据调用创建接口做写放大；本地开发请只绑回环地址",
+			EnvListenAddr, cfg.ListenAddr, EnvAdminToken)
+	}
 	// 解析与完整性校验收敛到这一个入口，调用方无需再单独调 Validate。
 	return cfg, cfg.Validate()
 }
