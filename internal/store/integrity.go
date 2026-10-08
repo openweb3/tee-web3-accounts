@@ -43,12 +43,13 @@ func (d fileData) mac(key []byte) (string, error) {
 	return base64.StdEncoding.EncodeToString(mac.Sum(nil)), nil
 }
 
-// verifyMac 校验完整性。空库（一条记录都没有）不做校验：首次启动时文件由本进程
-// 自己写出，不存在被篡改的窗口。
+// verifyMac 校验完整性。任何落盘的账户库都必须带 MAC，空账户数组也不例外：
+// 正常写入路径（persistLocked）总是先盖 MAC 再 rename，所以「文件存在但没有
+// MAC」只可能是手工构造或旧快照回滚。若豁免空库，宿主机把库清成
+// {"accounts":[]} 就能让 NextIndex 归零、索引从 0 重新分配——攻击者用自选
+// 密码占住新索引，而该索引派生出的地址正是原受害者的，等于拿到对受害者地址
+// 的合法签名。首次启动的正常路径是「文件不存在」，不经过这里。
 func (d fileData) verifyMac(key []byte) error {
-	if len(d.Accounts) == 0 {
-		return nil
-	}
 	if d.Mac == "" {
 		return errors.New("账户库缺少完整性校验（mac 字段为空），拒绝加载")
 	}

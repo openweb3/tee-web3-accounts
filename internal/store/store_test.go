@@ -30,6 +30,23 @@ func fakeAddress(index uint32) (string, error) {
 	return fmt.Sprintf("0x%040x", index), nil
 }
 
+// signAndMarshal 给 data 盖上合法 MAC 后序列化。落盘的账户库一律带 MAC，
+// 所以「内容损坏但完整性合法」的样本必须经这里构造，否则会先被完整性校验拦下，
+// 测不到本来想测的分支。
+func signAndMarshal(t *testing.T, data fileData) string {
+	t.Helper()
+	mac, err := data.mac(testIntegrityKey)
+	if err != nil {
+		t.Fatalf("mac: %v", err)
+	}
+	data.Mac = mac
+	raw, err := json.Marshal(data)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	return string(raw)
+}
+
 func openTemp(t *testing.T) (*Store, string) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "accounts.json")
@@ -229,22 +246,8 @@ func TestVerifyAddressesDetectsMnemonicChange(t *testing.T) {
 func TestOpenRejectsCorruptedFile(t *testing.T) {
 	t.Parallel()
 
-	// 这些样本都刻意保持「结构上损坏」。带账户的两个样本必须配一个合法 MAC，
+	// 这些样本都刻意保持「结构上损坏」，且全部配合法 MAC（落盘的库一律带 MAC），
 	// 否则它们会先在完整性校验上被拦下，测不到本来想测的那条分支。
-	signed := func(t *testing.T, data fileData) string {
-		t.Helper()
-		mac, err := data.mac(testIntegrityKey)
-		if err != nil {
-			t.Fatalf("mac: %v", err)
-		}
-		data.Mac = mac
-		raw, err := json.Marshal(data)
-		if err != nil {
-			t.Fatalf("Marshal: %v", err)
-		}
-		return string(raw)
-	}
-
 	validHash := PasswordHash{
 		Algorithm: algorithmArgon2id, Time: 1, MemoryKiB: 64, Threads: 1,
 		Salt: []byte("saltsaltsaltsalt"), Key: []byte("keykeykeykeykeykeykeykeykeykeykeyke"),
@@ -255,11 +258,11 @@ func TestOpenRejectsCorruptedFile(t *testing.T) {
 		content string
 	}{
 		{"不是 JSON", "{not json"},
-		{"版本不对", `{"version":99,"next_index":0,"accounts":[]}`},
-		{"next_index 与账户数不一致", `{"version":1,"next_index":3,"accounts":[]}`},
-		{"索引顺序错乱", signed(t, fileData{Version: fileVersion, NextIndex: 1,
+		{"版本不对", signAndMarshal(t, fileData{Version: 99})},
+		{"next_index 与账户数不一致", signAndMarshal(t, fileData{Version: fileVersion, NextIndex: 3})},
+		{"索引顺序错乱", signAndMarshal(t, fileData{Version: fileVersion, NextIndex: 1,
 			Accounts: []Account{{Index: 5, Address: "0x1", PasswordHash: validHash}}})},
-		{"缺地址", signed(t, fileData{Version: fileVersion, NextIndex: 1,
+		{"缺地址", signAndMarshal(t, fileData{Version: fileVersion, NextIndex: 1,
 			Accounts: []Account{{Index: 0, Address: "", PasswordHash: validHash}}})},
 	}
 
@@ -555,6 +558,39 @@ func TestOpenRejectsEmptyFile(t *testing.T) {
 	}
 }
 
+// TestOpenRejectsUnsignedEmptyFile 覆盖 P0 的回归：宿主机把账户库回滚成一行
+// 手工构造的空库（无 MAC），必须被拒绝，而不是带着空库启动后从索引 0 重新分配、
+// 让攻击者用自选密码劫持原受害者的地址。合法写出的空库（带 MAC）仍可加载。
+func TestOpenRejectsUnsignedEmptyFile(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "accounts.json")
+
+	if err := os.WriteFile(path, []byte(`{"version":1,"next_index":0,"accounts":[]}`), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if s, err := Open(path, fastParams, testIntegrityKey); err == nil {
+		s.Close()
+		t.Fatal("无 MAC 的空库竟然被接受")
+	}
+
+	// 同一份空库，盖上合法 MAC 后必须能正常打开（首写前的空库也是合法状态）。
+	// 注意 Accounts 必须是空切片而非 nil，序列化结果才与 `[]` 一致。
+	content := signAndMarshal(t, fileData{Version: fileVersion, Accounts: []Account{}})
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	s, err := Open(path, fastParams, testIntegrityKey)
+	if err != nil {
+		t.Fatalf("带合法 MAC 的空库应当可以打开: %v", err)
+	}
+	defer s.Close()
+	if s.Len() != 0 {
+		t.Errorf("Len() = %d, want 0", s.Len())
+	}
+}
+
 func TestSecondOpenFailsWhileLocked(t *testing.T) {
 	t.Parallel()
 
@@ -599,7 +635,8 @@ func TestOpenReleasesLockOnLoadFailure(t *testing.T) {
 	}
 
 	// 失败路径必须把锁还回去，否则修好文件后重开会撞上自己残留的 flock。
-	if err := os.WriteFile(path, []byte(`{"version":1,"next_index":0,"accounts":[]}`), 0o600); err != nil {
+	// 「修好」意味着内容与 MAC 都合法，所以要用 signAndMarshal 构造。
+	if err := os.WriteFile(path, []byte(signAndMarshal(t, fileData{Version: fileVersion})), 0o600); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
 	s, err := Open(path, fastParams, testIntegrityKey)

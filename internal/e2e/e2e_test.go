@@ -405,6 +405,42 @@ func TestTamperedStoreIsRejected(t *testing.T) {
 	}
 }
 
+// TestStoreRollbackToEmptyIsRejected 覆盖 P0 的端到端路径：宿主机把账户库回滚成
+// 一行手工构造的空库（无 MAC）后重启，真实二进制必须拒绝启动。若放行，服务会带着
+// 空库运行、索引从 0 重新分配，攻击者用自选密码占住索引 0 就能拿到对原受害者
+// 地址的合法签名。
+func TestStoreRollbackToEmptyIsRejected(t *testing.T) {
+	dataFile := filepath.Join(t.TempDir(), "accounts.json")
+
+	srv := start(t, testMnemonic, dataFile)
+	if status, payload := srv.do(t, http.MethodPost, "/v1/accounts",
+		fmt.Sprintf(`{"password":%q}`, password)); status != http.StatusCreated {
+		t.Fatalf("创建账户失败: %d %v", status, payload)
+	}
+	srv.stop(t)
+
+	if err := os.WriteFile(dataFile,
+		[]byte(`{"version":1,"next_index":0,"accounts":[]}`), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	cmd := exec.Command(binaryPath)
+	buffer := &bytes.Buffer{}
+	cmd.Env = append(os.Environ(),
+		"TEE_MNEMONIC="+testMnemonic,
+		"TEE_DATA_FILE="+dataFile,
+		"TEE_LISTEN_ADDR=127.0.0.1:"+fmt.Sprint(freePort(t)),
+	)
+	cmd.Stdout, cmd.Stderr = buffer, buffer
+
+	if err := cmd.Run(); err == nil {
+		t.Fatalf("被回滚清空的账户库竟然启动成功了:\n%s", buffer.String())
+	}
+	if !strings.Contains(buffer.String(), "完整性") {
+		t.Errorf("日志里没有指出完整性校验失败:\n%s", buffer.String())
+	}
+}
+
 func TestMnemonicMismatchIsRejected(t *testing.T) {
 	dataFile := filepath.Join(t.TempDir(), "accounts.json")
 
