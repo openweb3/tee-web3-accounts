@@ -35,6 +35,17 @@ type Account struct {
 	CreatedAt    time.Time    `json:"created_at"`
 }
 
+// clone 返回一份深拷贝，让调用方拿到的记录与内部状态彻底解耦。
+//
+// PasswordHash 里的 Salt / Key 是切片，浅拷贝会让调用方直接改到内部数组上：
+// 一份「副本」被改动后库里的验证子也跟着变，密码校验随之失效。
+func (a Account) clone() Account {
+	out := a
+	out.PasswordHash.Salt = append([]byte(nil), a.PasswordHash.Salt...)
+	out.PasswordHash.Key = append([]byte(nil), a.PasswordHash.Key...)
+	return out
+}
+
 // ErrCapacity 表示账户数量已达上限（由 SetMaxAccounts 设置）。
 var ErrCapacity = errors.New("store: 账户数量已达上限")
 
@@ -64,6 +75,8 @@ const (
 type Store struct {
 	path   string
 	params Argon2Params
+	// integrityKey 用于给整库算 HMAC，由调用方从助记词派生后传入。
+	integrityKey []byte
 
 	mu          sync.RWMutex
 	data        fileData
@@ -77,22 +90,32 @@ type fileData struct {
 	Version   int       `json:"version"`
 	NextIndex uint32    `json:"next_index"`
 	Accounts  []Account `json:"accounts"`
+	// Mac 覆盖除它自身以外的全部内容。攻击者改写密码验证子时 MAC 会失配，
+	// 这正是启动护栏按地址比对发现不了的那一类篡改。
+	Mac string `json:"mac"`
 }
 
 // Open 打开（必要时创建）账户库文件。
-func Open(path string, params Argon2Params) (*Store, error) {
+//
+// integrityKey 是账户库的完整性密钥，必须由调用方从助记词派生（wallet.IntegrityKey）。
+// 它不能为空：没有它账户库就是明文可改的，宿主机可以伪造任意账户的密码绑定。
+func Open(path string, params Argon2Params, integrityKey []byte) (*Store, error) {
 	if path == "" {
 		return nil, errors.New("store: 账户库路径不能为空")
 	}
 	if err := params.validate(); err != nil {
 		return nil, err
 	}
+	if len(integrityKey) == 0 {
+		return nil, errors.New("store: 必须提供账户库完整性密钥")
+	}
 
 	s := &Store{
-		path:     path,
-		params:   params,
-		data:     fileData{Version: fileVersion},
-		lockouts: make(map[uint32]lockoutState),
+		path:         path,
+		params:       params,
+		integrityKey: append([]byte(nil), integrityKey...),
+		data:         fileData{Version: fileVersion},
+		lockouts:     make(map[uint32]lockoutState),
 	}
 
 	// 从这里往后锁的所有权归 s：加载失败必须调 Close 把锁还回去，否则调用方在同一
@@ -138,6 +161,11 @@ func (s *Store) load() error {
 	}
 	if err := json.Unmarshal(raw, &s.data); err != nil {
 		return fmt.Errorf("store: 解析账户库 %s 失败: %w", s.path, err)
+	}
+	// 先验完整性再做其他校验。顺序很重要：完整性是「这份数据是否可信」的
+	// 前提，损坏性校验是在讨论一份可能已被改写的数据。
+	if err := s.data.verifyMac(s.integrityKey); err != nil {
+		return fmt.Errorf("store: 账户库 %s 完整性校验失败: %w", s.path, err)
 	}
 	if err := s.data.validate(); err != nil {
 		return fmt.Errorf("store: 账户库 %s 已损坏: %w", s.path, err)
@@ -207,6 +235,11 @@ func (d fileData) validate() error {
 			return fmt.Errorf("索引 %d 的密码验证子无效: %w", account.Index, err)
 		}
 	}
+	// 非空库必须带 MAC。verifyMac 已经在 load 里查过，这里再确认一次是为了让
+	// validate() 自身是自足的（它也是 OpenRejectsCorruptedFile 之类测试的断言点）。
+	if len(d.Accounts) > 0 && d.Mac == "" {
+		return errors.New("非空账户库必须带完整性校验")
+	}
 	return nil
 }
 
@@ -225,13 +258,15 @@ func (s *Store) Len() int {
 }
 
 // Get 按索引读取记录，第二个返回值表示是否存在。
+//
+// 返回的是深拷贝，调用方改动它不会影响库内状态。
 func (s *Store) Get(index uint32) (Account, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if index >= s.data.NextIndex {
 		return Account{}, false
 	}
-	return s.data.Accounts[index], true
+	return s.data.Accounts[index].clone(), true
 }
 
 // Create 分配下一个索引，用 derive 生成地址，连同密码验证子一起落盘。
@@ -272,11 +307,20 @@ func (s *Store) Create(password string, derive Deriver) (Account, error) {
 		CreatedAt:    time.Now().UTC(),
 	}
 
-	previous := s.data
-	s.data.Accounts = append(s.data.Accounts, account)
+	// 追加到一个全新的底层数组，这样回滚只需要截断，不必依赖「浅拷贝的切片头
+	// 恰好没看到新元素」这种微妙不变量。Create 本来就要整库重写，这点分配可以忽略。
+	previousLen := len(s.data.Accounts)
+	previousMac := s.data.Mac
+	grown := make([]Account, previousLen, previousLen+1)
+	copy(grown, s.data.Accounts)
+
+	s.data.Accounts = append(grown, account)
 	s.data.NextIndex = index + 1
 	if err := s.persistLocked(); err != nil {
-		s.data = previous // 落盘失败就回滚内存状态，保持与磁盘一致
+		// 落盘失败就回滚内存状态，保持与磁盘一致。
+		s.data.Accounts = s.data.Accounts[:previousLen]
+		s.data.NextIndex = index
+		s.data.Mac = previousMac
 		return Account{}, err
 	}
 	return account, nil
@@ -391,6 +435,13 @@ func (s *Store) clearLockout(index uint32) {
 // persistLocked 把整库原子写盘：先写同目录临时文件并 fsync，再 rename 覆盖。
 // 调用方必须持有写锁。
 func (s *Store) persistLocked() error {
+	// 先给内存里的这份状态盖上 MAC，写出去的内容才是自洽的。
+	mac, err := s.data.mac(s.integrityKey)
+	if err != nil {
+		return err
+	}
+	s.data.Mac = mac
+
 	buf, err := json.MarshalIndent(s.data, "", "  ")
 	if err != nil {
 		return fmt.Errorf("store: 序列化账户库失败: %w", err)

@@ -30,6 +30,9 @@ var testAddresses = []string{
 // fastParams 压低 Argon2id 代价，让接口测试跑得快。
 var fastParams = store.Argon2Params{Time: 1, MemoryKiB: 64, Threads: 1, KeyLength: 32}
 
+// testIntegrityKey 是 store 完整性密钥的测试替身，真实运行时由助记词派生。
+var testIntegrityKey = []byte("api-test-integrity-key-32b")
+
 func newTestHandler(t *testing.T) http.Handler {
 	t.Helper()
 
@@ -37,7 +40,7 @@ func newTestHandler(t *testing.T) http.Handler {
 	if err != nil {
 		t.Fatalf("wallet.Open: %v", err)
 	}
-	accountStore, err := store.Open(filepath.Join(t.TempDir(), "accounts.json"), fastParams)
+	accountStore, err := store.Open(filepath.Join(t.TempDir(), "accounts.json"), fastParams, testIntegrityKey)
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
@@ -356,7 +359,7 @@ func TestUnlockBackpressure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("wallet.Open: %v", err)
 	}
-	accountStore, err := store.Open(filepath.Join(t.TempDir(), "accounts.json"), fastParams)
+	accountStore, err := store.Open(filepath.Join(t.TempDir(), "accounts.json"), fastParams, testIntegrityKey)
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
@@ -405,7 +408,7 @@ func TestCreateRequiresAdminToken(t *testing.T) {
 	if err != nil {
 		t.Fatalf("wallet.Open: %v", err)
 	}
-	accountStore, err := store.Open(filepath.Join(t.TempDir(), "accounts.json"), fastParams)
+	accountStore, err := store.Open(filepath.Join(t.TempDir(), "accounts.json"), fastParams, testIntegrityKey)
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}

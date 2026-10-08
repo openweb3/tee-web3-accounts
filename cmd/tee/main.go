@@ -51,7 +51,7 @@ func run() error {
 		}
 	}
 
-	accountStore, err := store.Open(cfg.DataFile, store.DefaultArgon2Params)
+	accountStore, err := store.Open(cfg.DataFile, store.DefaultArgon2Params, accountWallet.IntegrityKey())
 	if err != nil {
 		return err
 	}

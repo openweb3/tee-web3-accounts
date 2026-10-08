@@ -1,6 +1,7 @@
 package store
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -9,11 +10,20 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"golang.org/x/crypto/argon2"
 )
 
 // fastParams 把 Argon2id 的代价压到最低，让测试跑得快；代价参数的正确性由
 // TestDefaultParamsAreUsable 单独覆盖。
 var fastParams = Argon2Params{Time: 1, MemoryKiB: 64, Threads: 1, KeyLength: 32}
+
+// testIntegrityKey 是测试用的完整性密钥。真实运行时它由助记词派生，
+// 测试不需要真的走一遍 BIP-39。
+var testIntegrityKey = []byte("test-integrity-key-32byte")
+
+// wrongIntegrityKey 用于模拟「换了助记词」或「攻击者伪造」的情况。
+var wrongIntegrityKey = []byte("attacker-key-32-bytes-long")
 
 // fakeAddress 造一个可预测的地址，让 store 完全不依赖钱包。
 func fakeAddress(index uint32) (string, error) {
@@ -23,7 +33,7 @@ func fakeAddress(index uint32) (string, error) {
 func openTemp(t *testing.T) (*Store, string) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "accounts.json")
-	s, err := Open(path, fastParams)
+	s, err := Open(path, fastParams, testIntegrityKey)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -133,7 +143,7 @@ func TestPersistAndReload(t *testing.T) {
 	t.Parallel()
 
 	path := filepath.Join(t.TempDir(), "accounts.json")
-	s, err := Open(path, fastParams)
+	s, err := Open(path, fastParams, testIntegrityKey)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -147,7 +157,7 @@ func TestPersistAndReload(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	reloaded, err := Open(path, fastParams)
+	reloaded, err := Open(path, fastParams, testIntegrityKey)
 	if err != nil {
 		t.Fatalf("重新打开: %v", err)
 	}
@@ -219,6 +229,27 @@ func TestVerifyAddressesDetectsMnemonicChange(t *testing.T) {
 func TestOpenRejectsCorruptedFile(t *testing.T) {
 	t.Parallel()
 
+	// 这些样本都刻意保持「结构上损坏」。带账户的两个样本必须配一个合法 MAC，
+	// 否则它们会先在完整性校验上被拦下，测不到本来想测的那条分支。
+	signed := func(t *testing.T, data fileData) string {
+		t.Helper()
+		mac, err := data.mac(testIntegrityKey)
+		if err != nil {
+			t.Fatalf("mac: %v", err)
+		}
+		data.Mac = mac
+		raw, err := json.Marshal(data)
+		if err != nil {
+			t.Fatalf("Marshal: %v", err)
+		}
+		return string(raw)
+	}
+
+	validHash := PasswordHash{
+		Algorithm: algorithmArgon2id, Time: 1, MemoryKiB: 64, Threads: 1,
+		Salt: []byte("saltsaltsaltsalt"), Key: []byte("keykeykeykeykeykeykeykeykeykeykeyke"),
+	}
+
 	tests := []struct {
 		name    string
 		content string
@@ -226,8 +257,10 @@ func TestOpenRejectsCorruptedFile(t *testing.T) {
 		{"不是 JSON", "{not json"},
 		{"版本不对", `{"version":99,"next_index":0,"accounts":[]}`},
 		{"next_index 与账户数不一致", `{"version":1,"next_index":3,"accounts":[]}`},
-		{"索引顺序错乱", `{"version":1,"next_index":1,"accounts":[{"index":5,"address":"0x1","password_hash":{"algorithm":"argon2id","time":1,"memory_kib":64,"threads":1,"salt":"c2FsdHNhbHRzYWx0c2E=","key":"a2V5a2V5a2V5a2V5a2V5a2V5a2V5a2V5a2V5a2V5a2V5a2V5"}}]}`},
-		{"缺地址", `{"version":1,"next_index":1,"accounts":[{"index":0,"address":"","password_hash":{"algorithm":"argon2id","time":1,"memory_kib":64,"threads":1,"salt":"c2FsdHNhbHRzYWx0c2E=","key":"a2V5a2V5a2V5a2V5a2V5a2V5a2V5a2V5a2V5a2V5a2V5a2V5"}}]}`},
+		{"索引顺序错乱", signed(t, fileData{Version: fileVersion, NextIndex: 1,
+			Accounts: []Account{{Index: 5, Address: "0x1", PasswordHash: validHash}}})},
+		{"缺地址", signed(t, fileData{Version: fileVersion, NextIndex: 1,
+			Accounts: []Account{{Index: 0, Address: "", PasswordHash: validHash}}})},
 	}
 
 	for _, tc := range tests {
@@ -237,10 +270,138 @@ func TestOpenRejectsCorruptedFile(t *testing.T) {
 			if err := os.WriteFile(path, []byte(tc.content), 0o600); err != nil {
 				t.Fatalf("WriteFile: %v", err)
 			}
-			if _, err := Open(path, fastParams); err == nil {
+			if _, err := Open(path, fastParams, testIntegrityKey); err == nil {
 				t.Fatal("损坏的账户库被接受了")
 			}
 		})
+	}
+}
+
+// TestOpenRejectsForgedPasswordBinding 是 P0 的回归测试：宿主机改写密码验证子后，
+// 即使把地址原样保留（骗过地址护栏），也必须因为 MAC 失配而被拒。
+func TestOpenRejectsForgedPasswordBinding(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "accounts.json")
+
+	realAddress := "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+	s, err := Open(path, fastParams, testIntegrityKey)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if _, err := s.Create("victim-strong-password", func(uint32) (string, error) {
+		return realAddress, nil
+	}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// 宿主机改写文件：地址保持真实，只把密码验证子换成攻击者自选密码的派生值。
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	var forged fileData
+	if err := json.Unmarshal(raw, &forged); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	attackerPassword := "host-chosen-pw-1234"
+	forgedSalt := []byte("hostpicked000000")
+	forged.Accounts[0].PasswordHash = PasswordHash{
+		Algorithm: algorithmArgon2id, Time: 1, MemoryKiB: 64, Threads: 1,
+		Salt: forgedSalt,
+		Key:  argon2.IDKey([]byte(attackerPassword), forgedSalt, 1, 64, 1, 32),
+	}
+	out, err := json.MarshalIndent(forged, "", "  ")
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if err := os.WriteFile(path, out, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	// 重启必须失败。加载阶段就该拦住，而不是等到有人来签名。
+	reopened, err := Open(path, fastParams, testIntegrityKey)
+	if err == nil {
+		reopened.Close()
+		t.Fatal("被伪造的账户库竟然加载成功了")
+	}
+	if !strings.Contains(err.Error(), "完整性") {
+		t.Errorf("错误信息应指向完整性校验失败，实际是: %v", err)
+	}
+}
+
+// TestOpenRejectsWrongIntegrityKey 确认换一把密钥就打不开：MAC 必须真的绑到助记词上，
+// 否则「用错误的密钥」和「没有密钥」就区分不开了。
+func TestOpenRejectsWrongIntegrityKey(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "accounts.json")
+	s, err := Open(path, fastParams, testIntegrityKey)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if _, err := s.Create("correct horse battery", fakeAddress); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	if reopened, err := Open(path, fastParams, wrongIntegrityKey); err == nil {
+		reopened.Close()
+		t.Fatal("换一把密钥竟然也能打开")
+	}
+	// 正确密钥仍然打得开。
+	reopened, err := Open(path, fastParams, testIntegrityKey)
+	if err != nil {
+		t.Fatalf("用原密钥重开失败: %v", err)
+	}
+	defer reopened.Close()
+	if err := reopened.VerifyPassword(0, "correct horse battery"); err != nil {
+		t.Errorf("重开后校验失败: %v", err)
+	}
+}
+
+func TestOpenRejectsMissingIntegrityKey(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "accounts.json")
+	if _, err := Open(path, fastParams, nil); err == nil {
+		t.Fatal("没有完整性密钥却接受了启动")
+	}
+}
+
+// TestGetReturnsDeepCopy 确认调用方拿到的是副本：改副本不会污染库内状态。
+func TestGetReturnsDeepCopy(t *testing.T) {
+	t.Parallel()
+
+	s, _ := openTemp(t)
+	defer s.Close()
+	created, err := s.Create("correct horse battery", fakeAddress)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	got, ok := s.Get(created.Index)
+	if !ok {
+		t.Fatal("Get 返回不存在")
+	}
+	got.Address = "0xdeadbeef"
+	got.PasswordHash.Key[0] ^= 0xFF
+
+	again, _ := s.Get(created.Index)
+	if again.Address != created.Address {
+		t.Errorf("改副本后地址被污染: %s", again.Address)
+	}
+	if again.PasswordHash.Key[0] != created.PasswordHash.Key[0] {
+		t.Error("改副本后密码验证子被污染")
+	}
+	if err := s.VerifyPassword(created.Index, "correct horse battery"); err != nil {
+		t.Errorf("改副本后正确密码被拒: %v", err)
 	}
 }
 
@@ -254,7 +415,7 @@ func TestOpenRejectsBadParams(t *testing.T) {
 		{Time: 1, MemoryKiB: 64, Threads: 1, KeyLength: 16},
 		{Time: 99, MemoryKiB: 64, Threads: 1, KeyLength: 32},
 	} {
-		if _, err := Open(path, params); err == nil {
+		if _, err := Open(path, params, testIntegrityKey); err == nil {
 			t.Errorf("%+v 应当被拒绝", params)
 		}
 	}
@@ -294,7 +455,7 @@ func TestConcurrentCreateKeepsIndicesUnique(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	reloaded, err := Open(path, fastParams)
+	reloaded, err := Open(path, fastParams, testIntegrityKey)
 	if err != nil {
 		t.Fatalf("重新打开: %v", err)
 	}
@@ -307,7 +468,7 @@ func TestDefaultParamsAreUsable(t *testing.T) {
 	t.Parallel()
 
 	path := filepath.Join(t.TempDir(), "accounts.json")
-	s, err := Open(path, DefaultArgon2Params)
+	s, err := Open(path, DefaultArgon2Params, testIntegrityKey)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -385,7 +546,7 @@ func TestOpenRejectsEmptyFile(t *testing.T) {
 	if err := os.WriteFile(path, nil, 0o600); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
-	s, err := Open(path, fastParams)
+	s, err := Open(path, fastParams, testIntegrityKey)
 	if s != nil {
 		s.Close()
 	}
@@ -399,7 +560,7 @@ func TestSecondOpenFailsWhileLocked(t *testing.T) {
 
 	s, path := openTemp(t)
 	defer s.Close()
-	if _, err := Open(path, fastParams); err == nil {
+	if _, err := Open(path, fastParams, testIntegrityKey); err == nil {
 		t.Fatal("锁被占住时竟然能重开同一个账户库")
 	}
 }
@@ -414,7 +575,7 @@ func TestOpenCleansStaleTempFiles(t *testing.T) {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	s, err := Open(path, fastParams)
+	s, err := Open(path, fastParams, testIntegrityKey)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -433,7 +594,7 @@ func TestOpenReleasesLockOnLoadFailure(t *testing.T) {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	if _, err := Open(path, fastParams); err == nil {
+	if _, err := Open(path, fastParams, testIntegrityKey); err == nil {
 		t.Fatal("损坏的账户库本该被拒绝")
 	}
 
@@ -441,7 +602,7 @@ func TestOpenReleasesLockOnLoadFailure(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`{"version":1,"next_index":0,"accounts":[]}`), 0o600); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
-	s, err := Open(path, fastParams)
+	s, err := Open(path, fastParams, testIntegrityKey)
 	if err != nil {
 		t.Fatalf("加载失败后重开被残留的文件锁挡住了: %v", err)
 	}

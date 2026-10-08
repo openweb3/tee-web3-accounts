@@ -1,6 +1,7 @@
 package wallet
 
 import (
+	"bytes"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -326,5 +327,86 @@ func TestParsePath(t *testing.T) {
 
 	if indices, err := parsePath("m"); err != nil || len(indices) != 0 {
 		t.Errorf(`parsePath("m") = %v, %v`, indices, err)
+	}
+}
+
+// TestIntegrityKeyIsDeterministic 确认完整性密钥稳定可复现：同一个助记词重启后
+// 必须算出同一把密钥，否则重启就打不开自己的账户库了。
+func TestIntegrityKeyIsDeterministic(t *testing.T) {
+	t.Parallel()
+
+	first, err := Open(Config{Mnemonic: hardhatMnemonic})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	second, err := Open(Config{Mnemonic: hardhatMnemonic})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if !bytes.Equal(first.IntegrityKey(), second.IntegrityKey()) {
+		t.Error("同一助记词两次派生的完整性密钥不同")
+	}
+	if len(first.IntegrityKey()) != integrityKeyLength {
+		t.Errorf("密钥长度 = %d, want %d", len(first.IntegrityKey()), integrityKeyLength)
+	}
+}
+
+// TestIntegrityKeyDependsOnMnemonic 确认换助记词会换密钥：否则攻击者拿任意助记词
+// 都能伪造账户库。
+func TestIntegrityKeyDependsOnMnemonic(t *testing.T) {
+	t.Parallel()
+
+	hardhat, err := Open(Config{Mnemonic: hardhatMnemonic})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	other, err := Open(Config{Mnemonic: "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if bytes.Equal(hardhat.IntegrityKey(), other.IntegrityKey()) {
+		t.Error("不同助记词派出了相同的完整性密钥")
+	}
+}
+
+// TestIntegrityKeyIsDomainSeparated 确认完整性密钥与 BIP-32 主节点互不相关：
+// 账户根私钥泄露不足以推出 MAC 密钥。这靠的是标签不同，而不是运气。
+func TestIntegrityKeyIsDomainSeparated(t *testing.T) {
+	t.Parallel()
+
+	w, err := Open(Config{Mnemonic: hardhatMnemonic})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	account, err := w.Account(0)
+	if err != nil {
+		t.Fatalf("Account: %v", err)
+	}
+	defer account.Destroy()
+
+	privBytes := account.priv.Key.Bytes()
+	key := w.IntegrityKey()
+	// 密钥与私钥长度不同（含包含关系即等价于密钥就是私钥），所以直接比不等。
+	if bytes.Equal(key, privBytes[:]) {
+		t.Error("完整性密钥与账户私钥相同，说明没有做域分离")
+	}
+}
+
+// TestIntegrityKeyReturnsCopy 确认调用方拿到副本，改它不影响钱包内部状态。
+func TestIntegrityKeyReturnsCopy(t *testing.T) {
+	t.Parallel()
+
+	w, err := Open(Config{Mnemonic: hardhatMnemonic})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	original := w.IntegrityKey()
+
+	mutated := w.IntegrityKey()
+	for i := range mutated {
+		mutated[i] ^= 0xFF
+	}
+	if !bytes.Equal(original, w.IntegrityKey()) {
+		t.Error("改副本污染了钱包内部的密钥")
 	}
 }

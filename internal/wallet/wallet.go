@@ -5,6 +5,8 @@
 package wallet
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 
@@ -36,6 +38,23 @@ type Config struct {
 type Wallet struct {
 	root     *bip32Node
 	rootPath string
+	// integrityKey 是给账户库做 HMAC 的密钥，由同一个种子派生但走独立域标签。
+	integrityKey []byte
+}
+
+// integrityKeyLabel 是完整性密钥的域分离标签。种子同时派生出 BIP-32 主节点和
+// 这个 HMAC 密钥，标签保证两者互不相关：拿到账户根私钥不足以伪造账户库 MAC。
+const integrityKeyLabel = "tee-web3-accounts/store-integrity/v1"
+
+// integrityKeyLength 是完整性密钥的字节数，与 HMAC-SHA256 输出等长。
+const integrityKeyLength = 32
+
+// IntegrityKey 返回账户库的完整性密钥。调用方用它对账户库做 HMAC，以检测宿主机
+// 对账户库文件的篡改（最典型的是把密码验证子换成攻击者自选密码）。
+//
+// 返回的是副本，调用方持有它不影响钱包内部的清理。
+func (w *Wallet) IntegrityKey() []byte {
+	return append([]byte(nil), w.integrityKey...)
 }
 
 // Open 校验助记词并生成钱包。助记词非法时直接报错，不做任何降级。
@@ -73,7 +92,18 @@ func Open(cfg Config) (*Wallet, error) {
 		clear(master.code[:])
 	}
 
-	return &Wallet{root: root, rootPath: rootPath}, nil
+	return &Wallet{
+		root:         root,
+		rootPath:     rootPath,
+		integrityKey: deriveIntegrityKey(seed),
+	}, nil
+}
+
+// deriveIntegrityKey 从种子派生账户库的 HMAC 密钥。种子的清理由调用方的 defer 负责。
+func deriveIntegrityKey(seed []byte) []byte {
+	mac := hmac.New(sha256.New, []byte(integrityKeyLabel))
+	mac.Write(seed)
+	return mac.Sum(nil)
 }
 
 // AccountRootPath 返回钱包使用的账户根路径。
