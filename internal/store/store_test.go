@@ -725,3 +725,62 @@ func TestHashMatchesRejectsParamsAboveCeiling(t *testing.T) {
 		})
 	}
 }
+
+// TestMacValidButAddressWrongStillCaught 覆盖完整性校验通过、但地址对不上的情形。
+//
+// 这是两道护栏的分工：HMAC 挡「宿主机改了文件」，地址比对挡「文件没被改，
+// 但记录本身与当前助记词不符」。这里模拟攻击者连 MAC 密钥一起掌握的情况
+// （文件被改且 MAC 合法），确认地址护栏仍会独立报警。
+func TestMacValidButAddressWrongStillCaught(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "accounts.json")
+	s, err := Open(path, fastParams, testIntegrityKey)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if _, err := s.Create("correct horse battery", fakeAddress); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// 读出来改地址，再用同一个密钥重算 MAC —— 完整性校验会通过。
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	var doc fileData
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	doc.Accounts[0].Address = "0x000000000000000000000000000000000000dEaD"
+	mac, err := doc.mac(testIntegrityKey)
+	if err != nil {
+		t.Fatalf("mac: %v", err)
+	}
+	doc.Mac = mac
+	out, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if err := os.WriteFile(path, out, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	reopened, err := Open(path, fastParams, testIntegrityKey)
+	if err != nil {
+		t.Fatalf("MAC 合法时应当能打开: %v", err)
+	}
+	defer reopened.Close()
+
+	// 完整性过了，但地址护栏必须独立发现不一致。
+	err = reopened.VerifyAddresses(fakeAddress)
+	if err == nil {
+		t.Fatal("地址已被换掉却没有被发现")
+	}
+	if !strings.Contains(err.Error(), "助记词") {
+		t.Errorf("错误信息应指向助记词不匹配: %v", err)
+	}
+}

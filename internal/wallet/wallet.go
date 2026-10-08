@@ -24,6 +24,10 @@ var ErrHashSize = errors.New("wallet: 待签名哈希必须是 32 字节")
 // ErrSignatureSize 表示签名长度不是 65 字节。
 var ErrSignatureSize = errors.New("wallet: 签名必须是 65 字节")
 
+// ErrAddressMismatch 表示现场派生出的地址与调用方预期的不一致，通常意味着
+// 当前助记词与派生该地址时用的不是同一个。
+var ErrAddressMismatch = errors.New("wallet: 派生地址与预期不一致")
+
 // Config 是构造钱包所需的全部参数。
 type Config struct {
 	// Mnemonic 是 TEE 启动时配置的 BIP-39 英文助记词，是所有私钥的唯一来源。
@@ -138,6 +142,24 @@ func (w *Wallet) Address(index uint32) (string, error) {
 	}
 	defer account.Destroy()
 	return account.Address, nil
+}
+
+// CheckAddress 现场派生指定索引的地址并与 expected 比对，不一致时返回
+// ErrAddressMismatch。
+//
+// 账户库保存地址的目的就是当助记词的一致性护栏，启动时已整体校验过一次。
+// 运行期逐条再查一遍，把「不可能发生」变成可检测：否则一旦库里某条记录与
+// 当前助记词不符，签名路径会拿着一个无人认领的私钥签出用户没预期的结果。
+func (w *Wallet) CheckAddress(index uint32, expected string) error {
+	address, err := w.Address(index)
+	if err != nil {
+		return err
+	}
+	if address != expected {
+		return fmt.Errorf("%w: 索引 %d 库里是 %s，当前助记词派生 %s",
+			ErrAddressMismatch, index, expected, address)
+	}
+	return nil
 }
 
 // Account 是一个实时派生出来的账户。

@@ -12,6 +12,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/openweb3/tee-web3-accounts/internal/store"
+	"github.com/openweb3/tee-web3-accounts/internal/wallet"
 )
 
 // 密码策略。密码是这套服务上唯一的身份凭据，同时也是解锁私钥的唯一钥匙，
@@ -88,31 +89,52 @@ func (s *Server) handleGetAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	account, ok := s.store.Get(index)
-	if !ok {
-		writeError(w, http.StatusNotFound, "账户不存在")
-		return
-	}
-
-	// 地址一律现场派生，账户库里那份只作助记词一致性护栏。
-	address, err := s.wallet.Address(index)
+	account, err := s.resolve(index)
 	if err != nil {
-		slog.Error("派生地址失败", "index", index, "error", err)
-		writeError(w, http.StatusInternalServerError, "派生地址失败")
-		return
-	}
-	if address != account.Address {
-		slog.Error("地址与账户库不一致，助记词可能被换过",
-			"index", index, "expected", account.Address, "derived", address)
-		writeError(w, http.StatusInternalServerError, "服务端助记词与账户库不一致")
+		writeAccountError(w, err)
 		return
 	}
 
 	writeJSON(w, http.StatusOK, accountResponse{
 		Index:   index,
 		Path:    s.wallet.AccountPath(index),
-		Address: address,
+		Address: account.Address,
 	})
+}
+
+// errAccountNotFound 表示索引在账户库里不存在。
+var errAccountNotFound = errors.New("api: 账户不存在")
+
+// resolve 取出索引对应的账户记录，并确认它与当前助记词一致。
+//
+// 签名与查询两条路径都必须过这一关，理由见 wallet.CheckAddress。
+func (s *Server) resolve(index uint32) (store.Account, error) {
+	account, ok := s.store.Get(index)
+	if !ok {
+		return store.Account{}, errAccountNotFound
+	}
+	if err := s.wallet.CheckAddress(index, account.Address); err != nil {
+		if errors.Is(err, wallet.ErrAddressMismatch) {
+			slog.Error("地址与账户库不一致，助记词可能被换过",
+				"index", index, "error", err)
+		} else {
+			slog.Error("派生地址失败", "index", index, "error", err)
+		}
+		return store.Account{}, err
+	}
+	return account, nil
+}
+
+// writeAccountError 把 resolve 的错误映射成响应。索引不存在是 404，其余是服务端故障。
+func writeAccountError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, errAccountNotFound):
+		writeError(w, http.StatusNotFound, "账户不存在")
+	case errors.Is(err, wallet.ErrAddressMismatch):
+		writeError(w, http.StatusInternalServerError, "服务端助记词与账户库不一致")
+	default:
+		writeError(w, http.StatusInternalServerError, "派生地址失败")
+	}
 }
 
 // handleSign 用指定账户对 32 字节哈希签名。
@@ -137,6 +159,9 @@ func (s *Server) handleSign(w http.ResponseWriter, r *http.Request) {
 	}
 	defer release()
 
+	// 顺序要紧：先校验密码，再解析账户。解析会把「索引不存在」变成 404，
+	// 放在校验之前就等于对外宣布这个索引存不存在 —— 而密码是这里唯一的
+	// 门禁，索引可枚举，所以不存在与密码错误必须返回完全相同的结果。
 	if err := s.store.VerifyPassword(request.Index, request.Password); err != nil {
 		var lockErr *store.LockoutError
 		switch {
@@ -154,15 +179,23 @@ func (s *Server) handleSign(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	account, err := s.wallet.Account(request.Index)
+	// 密码已通过，此时解析必然成功。校验与签名针对的是同一条记录，中途不会被
+	// 换掉；地址一致性也在这里顺带确认。
+	account, err := s.resolve(request.Index)
+	if err != nil {
+		writeAccountError(w, err)
+		return
+	}
+
+	signing, err := s.wallet.Account(request.Index)
 	if err != nil {
 		slog.Error("派生账户失败", "index", request.Index, "error", err)
 		writeError(w, http.StatusInternalServerError, "派生账户失败")
 		return
 	}
-	defer account.Destroy()
+	defer signing.Destroy()
 
-	signature, err := account.Sign(hash)
+	signature, err := signing.Sign(hash)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -170,7 +203,7 @@ func (s *Server) handleSign(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusOK, signResponse{
 		Index:     request.Index,
-		Path:      account.Path,
+		Path:      s.wallet.AccountPath(request.Index),
 		Address:   account.Address,
 		Hash:      "0x" + hex.EncodeToString(hash),
 		Signature: "0x" + hex.EncodeToString(signature),
