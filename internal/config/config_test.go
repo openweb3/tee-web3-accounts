@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/openweb3/tee-web3-accounts/internal/store"
 	"github.com/openweb3/tee-web3-accounts/internal/wallet"
 )
 
@@ -18,6 +19,7 @@ func clearEnv(t *testing.T) {
 		EnvMnemonic, EnvMnemonicFile, EnvPassphrase,
 		EnvAccountRootPath, EnvListenAddr, EnvDataFile, EnvMaxUnlocks,
 		EnvAdminToken, EnvMaxAccounts, EnvAllowPublicListen,
+		EnvArgon2Time, EnvArgon2MemoryKiB, EnvArgon2Threads,
 	} {
 		t.Setenv(name, "")
 	}
@@ -225,5 +227,58 @@ func TestValidateRejectsBlankFields(t *testing.T) {
 		} else if !strings.Contains(err.Error(), "config") {
 			t.Errorf("错误信息缺少前缀: %v", err)
 		}
+	}
+}
+
+func TestArgon2ParamsDefaultToStoreDefaults(t *testing.T) {
+	clearEnv(t)
+	t.Setenv(EnvMnemonic, testMnemonic)
+
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatalf("FromEnv: %v", err)
+	}
+	if cfg.Argon2Params != store.DefaultArgon2Params {
+		t.Errorf("缺省 Argon2 参数 = %+v, want %+v", cfg.Argon2Params, store.DefaultArgon2Params)
+	}
+}
+
+func TestArgon2ParamsAreConfigurable(t *testing.T) {
+	clearEnv(t)
+	t.Setenv(EnvMnemonic, testMnemonic)
+	t.Setenv(EnvArgon2Time, "5")
+	t.Setenv(EnvArgon2MemoryKiB, "131072")
+	t.Setenv(EnvArgon2Threads, "2")
+
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatalf("FromEnv: %v", err)
+	}
+	want := store.Argon2Params{Time: 5, MemoryKiB: 131072, Threads: 2, KeyLength: 32}
+	if cfg.Argon2Params != want {
+		t.Errorf("Argon2 参数 = %+v, want %+v", cfg.Argon2Params, want)
+	}
+}
+
+func TestArgon2ParamsRejectInvalidValues(t *testing.T) {
+	tests := []struct{ name, env, value string }{
+		{"轮数不是数字", EnvArgon2Time, "abc"},
+		{"轮数为零", EnvArgon2Time, "0"},
+		{"轮数过大", EnvArgon2Time, "99"},
+		{"内存过小", EnvArgon2MemoryKiB, "1"},
+		{"内存过大", EnvArgon2MemoryKiB, "2097152"},
+		{"并行度为零", EnvArgon2Threads, "0"},
+		{"并行度过大", EnvArgon2Threads, "999"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			clearEnv(t)
+			t.Setenv(EnvMnemonic, testMnemonic)
+			t.Setenv(tc.env, tc.value)
+			// 代价参数写错直接决定抗爆破能力，不允许静默兜底成默认值。
+			if _, err := FromEnv(); err == nil {
+				t.Errorf("%s=%q 应当被拒绝", tc.env, tc.value)
+			}
+		})
 	}
 }

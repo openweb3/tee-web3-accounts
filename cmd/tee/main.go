@@ -51,7 +51,7 @@ func run() error {
 		}
 	}
 
-	accountStore, err := store.Open(cfg.DataFile, store.DefaultArgon2Params, accountWallet.IntegrityKey())
+	accountStore, err := store.Open(cfg.DataFile, cfg.Argon2Params, accountWallet.IntegrityKey())
 	if err != nil {
 		return err
 	}
@@ -87,6 +87,8 @@ func run() error {
 		"listen", cfg.ListenAddr,
 		"data_file", cfg.DataFile,
 		"account_root_path", accountWallet.AccountRootPath(),
+		"argon2", fmt.Sprintf("t=%d m=%d KiB p=%d",
+			cfg.Argon2Params.Time, cfg.Argon2Params.MemoryKiB, cfg.Argon2Params.Threads),
 		"accounts", accountStore.Len(),
 	)
 

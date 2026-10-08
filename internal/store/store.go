@@ -103,7 +103,7 @@ func Open(path string, params Argon2Params, integrityKey []byte) (*Store, error)
 	if path == "" {
 		return nil, errors.New("store: 账户库路径不能为空")
 	}
-	if err := params.validate(); err != nil {
+	if err := params.Validate(); err != nil {
 		return nil, err
 	}
 	if len(integrityKey) == 0 {
@@ -368,6 +368,7 @@ func (s *Store) VerifyPassword(index uint32, password string) error {
 	}
 	if s.hashMatches(account.PasswordHash, password) {
 		s.clearLockout(index)
+		s.rehashLocked(index, password)
 		return nil
 	}
 	// 这次失败可能恰好把账户推进锁定状态：直接回 LockoutError，
@@ -378,13 +379,19 @@ func (s *Store) VerifyPassword(index uint32, password string) error {
 	return ErrUnauthorized
 }
 
-// hashMatches 校验密码。记录里的代价参数不可信（文件可被篡改）：超过当前配置的
-// 代价一律视为不匹配，防止攻击者把单次校验的内存/耗时顶到 validate 允许的上限。
+// hashMatches 校验密码。
+//
+// 用记录里自带的代价参数做派生，而不是当前配置的：这样调整配置参数时老记录仍然
+// 可校验，代价差异由 rehash 逐步消化（见 rehashLocked），而不是让全库一次性失效。
+//
+// 代价参数仍需设绝对上限（ceiling），防的是「篡改文件把单次校验内存顶到 1 GiB」
+// 这类资源耗尽。文件现在有 HMAC 保护，篡改本身会在 load 阶段被拦下，这里是纵深防御。
 func (s *Store) hashMatches(h PasswordHash, password string) bool {
 	if h.Algorithm != algorithmArgon2id || h.validate() != nil {
 		return false
 	}
-	if h.Time > s.params.Time || h.MemoryKiB > s.params.MemoryKiB || h.Threads > s.params.Threads {
+	if h.Time > argon2Ceiling.Time || h.MemoryKiB > argon2Ceiling.MemoryKiB ||
+		h.Threads > argon2Ceiling.Threads {
 		return false
 	}
 
@@ -393,6 +400,50 @@ func (s *Store) hashMatches(h PasswordHash, password string) bool {
 	key := argon2.IDKey(passwordBytes, h.Salt, h.Time, h.MemoryKiB, h.Threads, uint32(len(h.Key)))
 	defer clear(key)
 	return subtle.ConstantTimeCompare(key, h.Key) == 1
+}
+
+// rehashLocked 在密码校验成功后，把代价参数落后的记录按当前配置重新派生并落盘。
+//
+// 有了它，调高 Argon2 代价不需要重置所有用户的密码：每个用户下次成功登录时，
+// 自己那条记录就升级了。调低配置同理，不会再把老账户挡在门外。
+//
+// 任何失败都只记日志：rehash 是优化，不是安全边界，让它把已经成功的校验翻掉
+// 是本末倒置。
+func (s *Store) rehashLocked(index uint32, password string) {
+	s.mu.RLock()
+	if index >= uint32(len(s.data.Accounts)) {
+		s.mu.RUnlock()
+		return
+	}
+	current := s.data.Accounts[index].PasswordHash
+	needs := current.Time != s.params.Time ||
+		current.MemoryKiB != s.params.MemoryKiB ||
+		current.Threads != s.params.Threads
+	s.mu.RUnlock()
+
+	if !needs {
+		return
+	}
+
+	hash, err := hashPassword(password, s.params)
+	if err != nil {
+		slog.Error("重新派生密码验证子失败", "index", index, "error", err)
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if index >= uint32(len(s.data.Accounts)) {
+		return
+	}
+	previous := s.data.Accounts[index].PasswordHash
+	s.data.Accounts[index].PasswordHash = hash
+	if err := s.persistLocked(); err != nil {
+		s.data.Accounts[index].PasswordHash = previous
+		slog.Error("升级密码验证子后落盘失败", "index", index, "error", err)
+		return
+	}
+	slog.Info("密码验证子已升级到当前代价参数", "index", index)
 }
 
 func (s *Store) checkLockout(index uint32) (time.Duration, bool) {

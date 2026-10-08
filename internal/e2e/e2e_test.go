@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/openweb3/tee-web3-accounts/internal/wallet"
+	"golang.org/x/crypto/argon2"
 )
 
 const (
@@ -341,6 +342,69 @@ func TestFullFlow(t *testing.T) {
 
 // TestMnemonicMismatchIsRejected 是这套系统最重要的护栏：换错助记词必须拒绝启动，
 // 否则服务会安静地派生出一整套不同的地址，用户资产将不可达。
+// TestTamperedStoreIsRejected 覆盖 P0 的端到端路径：宿主机改写账户库里的密码验证子
+// 后重启，真实二进制必须拒绝启动。地址保持不变，所以这条路径此前是绿的。
+func TestTamperedStoreIsRejected(t *testing.T) {
+	dataFile := filepath.Join(t.TempDir(), "accounts.json")
+
+	srv := start(t, testMnemonic, dataFile)
+	if status, payload := srv.do(t, http.MethodPost, "/v1/accounts",
+		fmt.Sprintf(`{"password":%q}`, password)); status != http.StatusCreated {
+		t.Fatalf("创建账户失败: %d %v", status, payload)
+	}
+	srv.stop(t)
+
+	// 宿主机改写文件：地址原样保留，只把 password_hash 换成攻击者自选密码的派生值。
+	raw, err := os.ReadFile(dataFile)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	accounts, _ := doc["accounts"].([]any)
+	if len(accounts) != 1 {
+		t.Fatalf("账户数 = %d, want 1", len(accounts))
+	}
+	entry, _ := accounts[0].(map[string]any)
+	attackerPassword := "host-chosen-pw-1234"
+	salt := []byte("hostpicked000000")
+	entry["password_hash"] = map[string]any{
+		"algorithm":  "argon2id",
+		"time":       1,
+		"memory_kib": 64,
+		"threads":    1,
+		"salt":       salt,
+		"key": argon2.IDKey([]byte(attackerPassword), salt,
+			1, 64, 1, 32),
+	}
+	forged, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if err := os.WriteFile(dataFile, forged, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	// 必须拒绝启动，而不是带着伪造的密码绑定对外服务。
+	cmd := exec.Command(binaryPath)
+	buffer := &bytes.Buffer{}
+	cmd.Env = append(os.Environ(),
+		"TEE_MNEMONIC="+testMnemonic,
+		"TEE_DATA_FILE="+dataFile,
+		"TEE_LISTEN_ADDR=127.0.0.1:"+fmt.Sprint(freePort(t)),
+	)
+	cmd.Stdout, cmd.Stderr = buffer, buffer
+
+	if err := cmd.Run(); err == nil {
+		t.Fatalf("被篡改的账户库竟然启动成功了:\n%s", buffer.String())
+	}
+	if !strings.Contains(buffer.String(), "完整性") {
+		t.Errorf("日志里没有指出完整性校验失败:\n%s", buffer.String())
+	}
+}
+
 func TestMnemonicMismatchIsRejected(t *testing.T) {
 	dataFile := filepath.Join(t.TempDir(), "accounts.json")
 

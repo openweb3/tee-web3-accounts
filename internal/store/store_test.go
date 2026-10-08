@@ -609,9 +609,99 @@ func TestOpenReleasesLockOnLoadFailure(t *testing.T) {
 	defer s.Close()
 }
 
-// TestHashMatchesCapsRecordedParams 覆盖 M5：记录里的代价参数不可信，
-// 超过当前配置一律视为不匹配，防止篡改文件把单次校验内存顶到上限。
-func TestHashMatchesCapsRecordedParams(t *testing.T) {
+// TestVerifyPasswordSurvivesParamDowngrade 覆盖 P1：以前调低配置会让全库老账户
+// 永久无法签名（h.Time > s.params.Time 成立即视为不匹配），且没有任何自愈路径。
+// 现在校验按记录自带参数走，改配置不会再把用户挡在门外。
+func TestVerifyPasswordSurvivesParamDowngrade(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "accounts.json")
+	strong := Argon2Params{Time: 3, MemoryKiB: 512, Threads: 2, KeyLength: 32}
+	s, err := Open(path, strong, testIntegrityKey)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if _, err := s.Create("correct horse battery", fakeAddress); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// 运维把配置调低到比存量记录更弱的参数。
+	weaker := Argon2Params{Time: 1, MemoryKiB: 64, Threads: 1, KeyLength: 32}
+	downgraded, err := Open(path, weaker, testIntegrityKey)
+	if err != nil {
+		t.Fatalf("降配后打开失败: %v", err)
+	}
+	defer downgraded.Close()
+	if err := downgraded.VerifyPassword(0, "correct horse battery"); err != nil {
+		t.Fatalf("降配后正确密码被拒: %v", err)
+	}
+	if err := downgraded.VerifyPassword(0, "wrong"); !errors.Is(err, ErrUnauthorized) {
+		t.Errorf("降配后错误密码居然通过: %v", err)
+	}
+}
+
+// TestVerifyPasswordRehashesToCurrentParams 确认成功校验会把落后的记录升级到当前参数，
+// 因此调高代价不需要重置所有用户的密码。
+func TestVerifyPasswordRehashesToCurrentParams(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "accounts.json")
+	weak := Argon2Params{Time: 1, MemoryKiB: 64, Threads: 1, KeyLength: 32}
+	s, err := Open(path, weak, testIntegrityKey)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if _, err := s.Create("correct horse battery", fakeAddress); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	stronger := Argon2Params{Time: 2, MemoryKiB: 128, Threads: 2, KeyLength: 32}
+	upgraded, err := Open(path, stronger, testIntegrityKey)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	before, _ := upgraded.Get(0)
+	if before.PasswordHash.Time != 1 {
+		t.Fatalf("前置条件不成立: 记录 Time = %d", before.PasswordHash.Time)
+	}
+
+	if err := upgraded.VerifyPassword(0, "correct horse battery"); err != nil {
+		t.Fatalf("校验失败: %v", err)
+	}
+
+	after, _ := upgraded.Get(0)
+	if after.PasswordHash.Time != stronger.Time ||
+		after.PasswordHash.MemoryKiB != stronger.MemoryKiB ||
+		after.PasswordHash.Threads != stronger.Threads {
+		t.Errorf("rehash 未生效: t=%d m=%d p=%d",
+			after.PasswordHash.Time, after.PasswordHash.MemoryKiB, after.PasswordHash.Threads)
+	}
+	// 升级后的验证子必须仍然对应同一个密码，且落盘后能重开。
+	if err := upgraded.VerifyPassword(0, "correct horse battery"); err != nil {
+		t.Errorf("rehash 后校验失败: %v", err)
+	}
+	if err := upgraded.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	reopened, err := Open(path, stronger, testIntegrityKey)
+	if err != nil {
+		t.Fatalf("rehash 后重开失败: %v", err)
+	}
+	defer reopened.Close()
+	if err := reopened.VerifyPassword(0, "correct horse battery"); err != nil {
+		t.Errorf("重开后校验失败: %v", err)
+	}
+}
+
+// TestHashMatchesRejectsParamsAboveCeiling 确认绝对上限仍然生效：即使密钥泄露，
+// 一条记录也不能把单次校验顶到 1 GiB。
+func TestHashMatchesRejectsParamsAboveCeiling(t *testing.T) {
 	t.Parallel()
 
 	s, _ := openTemp(t)
@@ -621,20 +711,16 @@ func TestHashMatchesCapsRecordedParams(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 
-	if !s.hashMatches(account.PasswordHash, "correct horse battery") {
-		t.Error("正常记录应当匹配")
-	}
 	for name, mutate := range map[string]func(*PasswordHash){
-		"算法":     func(h *PasswordHash) { h.Algorithm = "sha256" },
-		"迭代轮数":   func(h *PasswordHash) { h.Time = 32 },
-		"内存顶到上限": func(h *PasswordHash) { h.MemoryKiB = 1 << 20 },
-		"并行度":    func(h *PasswordHash) { h.Threads = 64 },
+		"迭代轮数超上限": func(h *PasswordHash) { h.Time = argon2Ceiling.Time + 1 },
+		"内存超上限":   func(h *PasswordHash) { h.MemoryKiB = argon2Ceiling.MemoryKiB + 1 },
+		"并行度超上限":  func(h *PasswordHash) { h.Threads = argon2Ceiling.Threads + 1 },
 	} {
 		t.Run(name, func(t *testing.T) {
 			h := account.PasswordHash
 			mutate(&h)
 			if s.hashMatches(h, "correct horse battery") {
-				t.Error("被篡改的记录仍然匹配")
+				t.Error("超过绝对上限的记录竟然匹配了")
 			}
 		})
 	}

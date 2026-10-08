@@ -37,8 +37,20 @@ var DefaultArgon2Params = Argon2Params{
 	KeyLength: 32,
 }
 
-// validate 兜住明显不合理的参数，避免被篡改的记录导致巨量内存分配。
-func (p Argon2Params) validate() error {
+// argon2Ceiling 是单次校验允许的最高代价，与当前配置无关。校验时按记录自带的
+// 参数派生（这样调参不会作废老记录），但不允许超过这个上限。
+//
+// 上限的作用是纵深防御：文件已有 HMAC 保护，篡改会在加载阶段被拦下；万一密钥
+// 泄露或校验被绕过，这里保证攻击者无法用一条记录把单次校验顶到 1 GiB 内存。
+var argon2Ceiling = Argon2Params{
+	Time:      16,
+	MemoryKiB: 256 * 1024,
+	Threads:   8,
+	KeyLength: 32,
+}
+
+// Validate 兜住明显不合理的参数，避免被篡改的记录导致巨量内存分配。
+func (p Argon2Params) Validate() error {
 	switch {
 	case p.Time == 0 || p.Time > 32:
 		return fmt.Errorf("store: argon2 迭代轮数 %d 超出 [1,32]", p.Time)
@@ -111,5 +123,5 @@ func (h PasswordHash) validate() error {
 		MemoryKiB: h.MemoryKiB,
 		Threads:   h.Threads,
 		KeyLength: uint32(len(h.Key)),
-	}.validate()
+	}.Validate()
 }

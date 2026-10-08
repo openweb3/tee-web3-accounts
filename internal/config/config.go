@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/openweb3/tee-web3-accounts/internal/store"
 	"github.com/openweb3/tee-web3-accounts/internal/wallet"
 )
 
@@ -25,6 +26,9 @@ const (
 	EnvAdminToken        = "TEE_ADMIN_TOKEN"
 	EnvMaxAccounts       = "TEE_MAX_ACCOUNTS"
 	EnvAllowPublicListen = "TEE_ALLOW_PUBLIC_LISTEN"
+	EnvArgon2Time        = "TEE_ARGON2_TIME"
+	EnvArgon2MemoryKiB   = "TEE_ARGON2_MEMORY_KIB"
+	EnvArgon2Threads     = "TEE_ARGON2_THREADS"
 )
 
 // 默认值。监听地址默认只绑回环：TEE 上不该把托管接口直接暴露到公网。
@@ -44,12 +48,67 @@ type Config struct {
 	AdminToken           string
 	MaxAccounts          uint32
 	AllowPublicListen    bool
+	Argon2Params         store.Argon2Params
+}
+
+// argon2Defaults 是各项代价参数的缺省值。三项分开配置而不是打包成一个
+// 「强度档位」，是因为调高内存和调高迭代轮数对机器的压测方式完全不同。
+var argon2Defaults = store.Argon2Params{
+	Time:      store.DefaultArgon2Params.Time,
+	MemoryKiB: store.DefaultArgon2Params.MemoryKiB,
+	Threads:   store.DefaultArgon2Params.Threads,
+	KeyLength: store.DefaultArgon2Params.KeyLength,
+}
+
+// readArgon2Params 读三项 Argon2 代价参数。留空即用默认值，非法值直接报错 ——
+// 代价参数写错会直接决定密码验证的抗爆破能力，不该被静默兜底。
+func readArgon2Params() (store.Argon2Params, error) {
+	params := argon2Defaults
+
+	if err := readUint32Env(EnvArgon2Time, &params.Time); err != nil {
+		return store.Argon2Params{}, err
+	}
+	if err := readUint32Env(EnvArgon2MemoryKiB, &params.MemoryKiB); err != nil {
+		return store.Argon2Params{}, err
+	}
+	rawThreads := uint32(params.Threads)
+	if err := readUint32Env(EnvArgon2Threads, &rawThreads); err != nil {
+		return store.Argon2Params{}, err
+	}
+	if rawThreads > 255 {
+		return store.Argon2Params{}, fmt.Errorf("%s=%d 超出 [1,255]", EnvArgon2Threads, rawThreads)
+	}
+	params.Threads = uint8(rawThreads)
+
+	if err := params.Validate(); err != nil {
+		return store.Argon2Params{}, err
+	}
+	return params, nil
+}
+
+// readUint32Env 把一个环境变量读进 dst，留空则不动 dst。
+func readUint32Env(name string, dst *uint32) error {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return nil
+	}
+	value, err := strconv.ParseUint(raw, 10, 32)
+	if err != nil {
+		return fmt.Errorf("%s 必须是正整数，实际 %q", name, raw)
+	}
+	*dst = uint32(value)
+	return nil
 }
 
 // FromEnv 读取配置。缺失或冲突的配置一律直接报错，不做任何兜底默认 —— 尤其是助记词，
 // 给默认值等于把所有人的资产都交给一个公开的种子。
 func FromEnv() (Config, error) {
 	mnemonic, err := readMnemonic()
+	if err != nil {
+		return Config{}, err
+	}
+
+	argon2Params, err := readArgon2Params()
 	if err != nil {
 		return Config{}, err
 	}
@@ -81,6 +140,7 @@ func FromEnv() (Config, error) {
 		AdminToken:           os.Getenv(EnvAdminToken),
 		MaxAccounts:          maxAccounts,
 		AllowPublicListen:    strings.TrimSpace(os.Getenv(EnvAllowPublicListen)) == "1",
+		Argon2Params:         argon2Params,
 	}
 	if cfg.ListenAddr == "" {
 		cfg.ListenAddr = DefaultListenAddr
