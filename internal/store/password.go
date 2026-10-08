@@ -37,11 +37,14 @@ var DefaultArgon2Params = Argon2Params{
 	KeyLength: 32,
 }
 
-// argon2Ceiling 是单次校验允许的最高代价，与当前配置无关。校验时按记录自带的
-// 参数派生（这样调参不会作废老记录），但不允许超过这个上限。
+// argon2Ceiling 是单次派生允许的绝对上限，配置与存量记录共用同一个上界（见
+// Argon2Params.Validate）。收敛成一套是为了根除「两套上限打架」：以前配置能
+// 顶到 1 GiB，而校验只认 256 MiB，运维把参数配高后新建的账户会在每次校验时被
+// ceiling 判为「密码错误」，正确密码永远 401 且无任何日志指向真因，账户静默
+// 永久不可用。现在创建用的参数天然 ≤ 校验允许的上限，不可能造出校验不了的记录。
 //
-// 上限的作用是纵深防御：文件已有 HMAC 保护，篡改会在加载阶段被拦下；万一密钥
-// 泄露或校验被绕过，这里保证攻击者无法用一条记录把单次校验顶到 1 GiB 内存。
+// 上限同时是资源护栏：即使完整性密钥泄露、文件被伪造，一条记录也无法把单次
+// 校验的内存顶到 1 GiB。
 var argon2Ceiling = Argon2Params{
 	Time:      16,
 	MemoryKiB: 256 * 1024,
@@ -49,15 +52,17 @@ var argon2Ceiling = Argon2Params{
 	KeyLength: 32,
 }
 
-// Validate 兜住明显不合理的参数，避免被篡改的记录导致巨量内存分配。
+// Validate 校验代价参数是否落在 [下界, argon2Ceiling] 之内。配置（Open 时）与
+// 存量记录（h.validate()）都走这一个入口，因此不存在「创建合法但校验必拒」的
+// 参数区间，也不可能被一条记录顶出巨量内存分配。
 func (p Argon2Params) Validate() error {
 	switch {
-	case p.Time == 0 || p.Time > 32:
-		return fmt.Errorf("store: argon2 迭代轮数 %d 超出 [1,32]", p.Time)
-	case p.MemoryKiB < 8 || p.MemoryKiB > 1<<20:
-		return fmt.Errorf("store: argon2 内存用量 %d KiB 超出 [8,1048576]", p.MemoryKiB)
-	case p.Threads == 0 || p.Threads > 64:
-		return fmt.Errorf("store: argon2 并行度 %d 超出 [1,64]", p.Threads)
+	case p.Time == 0 || p.Time > argon2Ceiling.Time:
+		return fmt.Errorf("store: argon2 迭代轮数 %d 超出 [1,%d]", p.Time, argon2Ceiling.Time)
+	case p.MemoryKiB < 8 || p.MemoryKiB > argon2Ceiling.MemoryKiB:
+		return fmt.Errorf("store: argon2 内存用量 %d KiB 超出 [8,%d]", p.MemoryKiB, argon2Ceiling.MemoryKiB)
+	case p.Threads == 0 || p.Threads > argon2Ceiling.Threads:
+		return fmt.Errorf("store: argon2 并行度 %d 超出 [1,%d]", p.Threads, argon2Ceiling.Threads)
 	case p.KeyLength != 32:
 		return fmt.Errorf("store: argon2 密钥长度必须是 32，实际 %d", p.KeyLength)
 	}

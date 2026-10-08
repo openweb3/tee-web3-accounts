@@ -736,6 +736,32 @@ func TestVerifyPasswordRehashesToCurrentParams(t *testing.T) {
 	}
 }
 
+// TestCreateAtCeilingStaysVerifiable 是 P1 的回归：以前配置能顶到 1 GiB、校验只认
+// 256 MiB，运维把参数配高后新建的账户会在每次校验时被 ceiling 判为「密码错误」，
+// 正确密码永远 401 且没有日志指向真因。现在两套上限收敛成一套，按 ceiling 顶格
+// 参数创建的记录必须仍能正常校验。
+func TestCreateAtCeilingStaysVerifiable(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "accounts.json")
+	// 直接取 ceiling 的顶格值（KeyLength 固定 32），这是配置允许的最大代价。
+	atCeiling := Argon2Params{
+		Time: argon2Ceiling.Time, MemoryKiB: argon2Ceiling.MemoryKiB,
+		Threads: argon2Ceiling.Threads, KeyLength: 32,
+	}
+	s, err := Open(path, atCeiling, testIntegrityKey)
+	if err != nil {
+		t.Fatalf("按 ceiling 参数打开失败: %v", err)
+	}
+	defer s.Close()
+	if _, err := s.Create("correct horse battery", fakeAddress); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := s.VerifyPassword(0, "correct horse battery"); err != nil {
+		t.Errorf("按 ceiling 参数创建的账户校验被拒: %v", err)
+	}
+}
+
 // TestHashMatchesRejectsParamsAboveCeiling 确认绝对上限仍然生效：即使密钥泄露，
 // 一条记录也不能把单次校验顶到 1 GiB。
 func TestHashMatchesRejectsParamsAboveCeiling(t *testing.T) {

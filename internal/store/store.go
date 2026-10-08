@@ -384,14 +384,11 @@ func (s *Store) VerifyPassword(index uint32, password string) error {
 // 用记录里自带的代价参数做派生，而不是当前配置的：这样调整配置参数时老记录仍然
 // 可校验，代价差异由 rehash 逐步消化（见 rehashLocked），而不是让全库一次性失效。
 //
-// 代价参数仍需设绝对上限（ceiling），防的是「篡改文件把单次校验内存顶到 1 GiB」
-// 这类资源耗尽。文件现在有 HMAC 保护，篡改本身会在 load 阶段被拦下，这里是纵深防御。
+// 参数合法性由 h.validate() 兜底（其中已含 argon2Ceiling 绝对上限），防的是
+// 「篡改文件把单次校验内存顶到 1 GiB」这类资源耗尽。文件现在有 HMAC 保护，
+// 且 load 阶段就逐条 validate 过，所以这里是纵深防御。
 func (s *Store) hashMatches(h PasswordHash, password string) bool {
-	if h.Algorithm != algorithmArgon2id || h.validate() != nil {
-		return false
-	}
-	if h.Time > argon2Ceiling.Time || h.MemoryKiB > argon2Ceiling.MemoryKiB ||
-		h.Threads > argon2Ceiling.Threads {
+	if h.validate() != nil {
 		return false
 	}
 
