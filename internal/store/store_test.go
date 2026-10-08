@@ -424,6 +424,30 @@ func TestOpenCleansStaleTempFiles(t *testing.T) {
 	}
 }
 
+func TestOpenReleasesLockOnLoadFailure(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "accounts.json")
+	if err := os.WriteFile(path, []byte("{corrupt"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	if _, err := Open(path, fastParams); err == nil {
+		t.Fatal("损坏的账户库本该被拒绝")
+	}
+
+	// 失败路径必须把锁还回去，否则修好文件后重开会撞上自己残留的 flock。
+	if err := os.WriteFile(path, []byte(`{"version":1,"next_index":0,"accounts":[]}`), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	s, err := Open(path, fastParams)
+	if err != nil {
+		t.Fatalf("加载失败后重开被残留的文件锁挡住了: %v", err)
+	}
+	defer s.Close()
+}
+
 // TestHashMatchesCapsRecordedParams 覆盖 M5：记录里的代价参数不可信，
 // 超过当前配置一律视为不匹配，防止篡改文件把单次校验内存顶到上限。
 func TestHashMatchesCapsRecordedParams(t *testing.T) {

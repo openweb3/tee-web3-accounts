@@ -95,43 +95,54 @@ func Open(path string, params Argon2Params) (*Store, error) {
 		lockouts: make(map[uint32]lockoutState),
 	}
 
+	// 从这里往后锁的所有权归 s：加载失败必须调 Close 把锁还回去，否则调用方在同一
+	// 进程里修好文件再 Open 会撞上自己残留的 flock（表现为「被另一个实例占用」）。
 	lock, err := acquireLock(path)
 	if err != nil {
 		return nil, err
 	}
 	s.lockFile = lock
-	cleanupStaleTempFiles(path)
+	if err := s.load(); err != nil {
+		_ = s.Close()
+		return nil, err
+	}
+	return s, nil
+}
 
-	info, err := os.Stat(path)
+// load 读取并校验账户库，把结果填进 s。文件不存在时保留空库（首次启动的正常路径）。
+func (s *Store) load() error {
+	cleanupStaleTempFiles(s.path)
+
+	info, err := os.Stat(s.path)
 	switch {
 	case errors.Is(err, os.ErrNotExist):
-		return s, nil
+		return nil
 	case err != nil:
-		return nil, fmt.Errorf("store: 读取账户库 %s 失败: %w", path, err)
+		return fmt.Errorf("store: 读取账户库 %s 失败: %w", s.path, err)
 	}
 
 	// 文件里有密码验证子，权限必须收紧；这里只告警不拒绝启动，避免容器里
 	// 因 umask 差异导致服务起不来。
 	if mode := info.Mode().Perm(); mode&0o077 != 0 {
-		slog.Warn("账户库文件权限过宽，建议 chmod 600", "path", path, "mode", fmt.Sprintf("%04o", mode))
+		slog.Warn("账户库文件权限过宽，建议 chmod 600", "path", s.path, "mode", fmt.Sprintf("%04o", mode))
 	}
 
-	raw, err := os.ReadFile(path)
+	raw, err := os.ReadFile(s.path)
 	if err != nil {
-		return nil, fmt.Errorf("store: 读取账户库 %s 失败: %w", path, err)
+		return fmt.Errorf("store: 读取账户库 %s 失败: %w", s.path, err)
 	}
 	// 正常写入走「临时文件 + rename」，落盘的账号库绝不可能是 0 字节；
 	// 空文件只可能是截断或误创建，按损坏处理，避免静默丢掉全部密码绑定。
 	if len(raw) == 0 {
-		return nil, fmt.Errorf("store: 账户库 %s 是空文件，疑似损坏，拒绝加载", path)
+		return fmt.Errorf("store: 账户库 %s 是空文件，疑似损坏，拒绝加载", s.path)
 	}
 	if err := json.Unmarshal(raw, &s.data); err != nil {
-		return nil, fmt.Errorf("store: 解析账户库 %s 失败: %w", path, err)
+		return fmt.Errorf("store: 解析账户库 %s 失败: %w", s.path, err)
 	}
 	if err := s.data.validate(); err != nil {
-		return nil, fmt.Errorf("store: 账户库 %s 已损坏: %w", path, err)
+		return fmt.Errorf("store: 账户库 %s 已损坏: %w", s.path, err)
 	}
-	return s, nil
+	return nil
 }
 
 // acquireLock 在数据文件旁占一把排他文件锁。锁放在独立的 .lock 侧车上而不是
